@@ -1,0 +1,12 @@
+# Sensitive files — never commit
+ldap_certs/
+ansible/files/ca.crt
+ansible/group_vars/all.yml
+
+# Local tooling — not for public repo
+.claude/
+CLAUDE.md
+CLAUDE_CN.md
+admin/__pycache__/
+*.pyc
+_update_readme.py

@@ -1,0 +1,398 @@
+#!/bin/bash
+#===============================================================================
+# OpenLDAP 从节点（第二主节点）安装脚本
+# 作为多主镜像模式的同位节点安装。
+#
+# 前提条件：
+#   - 主节点 (ldap01) 已安装并运行
+#   - 已复制 TLS 证书
+#   - 已配置 config/ldap.conf
+#===============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -f "${SCRIPT_DIR}/../config/ldap.conf" ]; then
+    source "${SCRIPT_DIR}/../config/ldap.conf"
+else
+    echo "错误: 未找到 config/ldap.conf" >&2
+    exit 1
+fi
+
+validate_config "LDAP_SUFFIX" "LDAP_DC1" "LDAP_DC2" "LDAP_MASTER1" "LDAP_MASTER2"
+ensure_rootpw
+ensure_ropw
+
+OS_VER=$(detect_os)
+log_info "开始 LDAP 从节点安装 $(hostname) (RHEL/CentOS ${OS_VER})"
+
+#------------------------------------------------------------------------------
+# 第 1 步：安装软件包
+#------------------------------------------------------------------------------
+log_info "安装 OpenLDAP 软件包..."
+yum -y install openldap compat-openldap openldap-clients openldap-servers \
+    openldap-devel migrationtools python-ldap php-ldap || {
+    log_error "软件包安装失败"
+    echo "错误: 软件包安装失败。" >&2
+    exit 1
+}
+echo "[OK] 软件包安装完成。"
+
+#------------------------------------------------------------------------------
+# 第 2 步：配置 Root 密码和域
+#------------------------------------------------------------------------------
+log_info "配置 root 密码..."
+
+SSHAPW=$(slappasswd -s "${LDAP_ROOTPW}")
+sed -i '/olcRootPW: /d' /etc/openldap/slapd.d/cn\=config/olcDatabase\=\{2\}hdb.ldif
+echo "olcRootPW: ${SSHAPW}" >> /etc/openldap/slapd.d/cn\=config/olcDatabase\=\{2\}hdb.ldif
+sed -i "s/dc=my-domain,dc=com/${LDAP_SUFFIX}/g" \
+    /etc/openldap/slapd.d/cn\=config/olcDatabase\=\{2\}hdb.ldif
+sed -i "s/dc=my-domain,dc=com/${LDAP_SUFFIX}/g" \
+    /etc/openldap/slapd.d/cn\=config/olcDatabase\=\{1\}monitor.ldif
+
+echo "[OK] 密码和域已配置。"
+
+#------------------------------------------------------------------------------
+# 第 3 步：启动 slapd
+#------------------------------------------------------------------------------
+log_info "启动 slapd..."
+systemctl start slapd || { log_error "slapd 启动失败"; echo "错误: slapd 启动失败。" >&2; exit 1; }
+systemctl enable slapd
+echo "[OK] slapd 已启动。"
+
+#------------------------------------------------------------------------------
+# 第 4 步：数据库
+#------------------------------------------------------------------------------
+cp /usr/share/openldap-servers/DB_CONFIG.example /var/lib/ldap/DB_CONFIG
+chown ldap:ldap -R /var/lib/ldap
+chmod 700 -R /var/lib/ldap
+echo "[OK] 数据库已配置。"
+
+#------------------------------------------------------------------------------
+# 第 5 步：Schema
+#------------------------------------------------------------------------------
+log_info "加载 schema..."
+for schema in cosine.ldif nis.ldif inetorgperson.ldif samba.ldif sudo.ldif; do
+    [ -f "/etc/openldap/schema/${schema}" ] && \
+        ldapadd -Y EXTERNAL -H ldapi:/// -f "/etc/openldap/schema/${schema}" 2>/dev/null || true
+done
+echo "[OK] Schema 已处理。"
+
+#------------------------------------------------------------------------------
+# 第 6 步：日志配置
+#------------------------------------------------------------------------------
+if ! grep -q "local4.*slapd" /etc/rsyslog.conf 2>/dev/null; then
+    echo "local4.* /var/log/slapd.log" >> /etc/rsyslog.conf
+    systemctl restart rsyslog 2>/dev/null || true
+fi
+
+cat > /tmp/loglevel.ldif << "EOF"
+dn: cn=config
+changetype: modify
+replace: olcLogLevel
+olcLogLevel: stats
+EOF
+ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/loglevel.ldif
+systemctl restart slapd
+echo "[OK] 日志已配置。"
+
+#------------------------------------------------------------------------------
+# 第 7 步：syncprov 模块
+#------------------------------------------------------------------------------
+yum install -y compat-openldap 2>/dev/null || true
+cat > /tmp/syncprov_mod.ldif << EOF
+dn: cn=module,cn=config
+objectClass: olcModuleList
+cn: module
+olcModulePath: /usr/lib64/openldap
+olcModuleLoad: syncprov.la
+EOF
+ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/syncprov_mod.ldif 2>/dev/null || true
+echo "[OK] syncprov 已加载。"
+
+#------------------------------------------------------------------------------
+# 第 8 步：多主复制（从节点使用服务器 ID 2）
+#------------------------------------------------------------------------------
+log_info "配置多主镜像模式复制（服务器 ID: ${LDAP_SERVERID2}）..."
+
+if [ "${LDAP_TLS_ENABLED:-yes}" = "yes" ]; then
+    MASTER1_URI="ldaps://${LDAP_MASTER1}:${LDAPS_PORT}"
+    MASTER2_URI="ldaps://${LDAP_MASTER2}:${LDAPS_PORT}"
+else
+    MASTER1_URI="ldap://${LDAP_MASTER1}:${LDAP_PORT}"
+    MASTER2_URI="ldap://${LDAP_MASTER2}:${LDAP_PORT}"
+fi
+
+# 服务器 ID（从节点使用 ID 2）
+cat > /tmp/olcserverid.ldif << EOF
+dn: cn=config
+changetype: modify
+add: olcServerID
+olcServerID: ${LDAP_SERVERID2}
+EOF
+ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/olcserverid.ldif
+
+# 配置复制
+cat > /tmp/configrep.ldif << EOF
+dn: cn=config
+changetype: modify
+replace: olcServerID
+olcServerID: ${LDAP_SERVERID1} ${MASTER1_URI}
+olcServerID: ${LDAP_SERVERID2} ${MASTER2_URI}
+
+dn: olcOverlay=syncprov,olcDatabase={0}config,cn=config
+changetype: add
+objectClass: olcOverlayConfig
+objectClass: olcSyncProvConfig
+olcOverlay: syncprov
+
+dn: olcDatabase={0}config,cn=config
+changetype: modify
+add: olcSyncRepl
+olcSyncRepl: rid=001 provider=${MASTER1_URI} binddn="cn=Manager,${LDAP_SUFFIX}"
+  bindmethod=simple credentials="${LDAP_ROOTPW}" searchbase="cn=config"
+  type=refreshAndPersist retry="5 5 300 5" timeout=1
+olcSyncRepl: rid=002 provider=${MASTER2_URI} binddn="cn=Manager,${LDAP_SUFFIX}"
+  bindmethod=simple credentials="${LDAP_ROOTPW}" searchbase="cn=config"
+  type=refreshAndPersist retry="5 5 300 5" timeout=1
+-
+add: olcMirrorMode
+olcMirrorMode: TRUE
+EOF
+ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/configrep.ldif
+
+# 数据库 syncprov
+cat > /tmp/syncprov.ldif << EOF
+dn: olcOverlay=syncprov,olcDatabase={2}hdb,cn=config
+changetype: add
+objectClass: olcOverlayConfig
+objectClass: olcSyncProvConfig
+olcOverlay: syncprov
+EOF
+ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/syncprov.ldif
+
+# 数据库复制
+cat > /tmp/olcdatabasehdb.ldif << EOF
+dn: olcDatabase={2}hdb,cn=config
+changetype: modify
+add: olcSyncRepl
+olcSyncRepl: rid=004 provider=${MASTER1_URI} binddn="cn=Manager,${LDAP_SUFFIX}"
+  bindmethod=simple credentials="${LDAP_ROOTPW}" searchbase="${LDAP_SUFFIX}"
+  type=refreshOnly interval=00:00:00:10 retry="5 5 300 5" timeout=1
+olcSyncRepl: rid=005 provider=${MASTER2_URI} binddn="cn=Manager,${LDAP_SUFFIX}"
+  bindmethod=simple credentials="${LDAP_ROOTPW}" searchbase="${LDAP_SUFFIX}"
+  type=refreshOnly interval=00:00:00:10 retry="5 5 300 5" timeout=1
+-
+add: olcDbIndex
+olcDbIndex: entryUUID  eq
+-
+add: olcDbIndex
+olcDbIndex: entryCSN  eq
+-
+add: olcMirrorMode
+olcMirrorMode: TRUE
+EOF
+ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/olcdatabasehdb.ldif
+
+echo "[OK] 多主复制已配置（服务器 ID: ${LDAP_SERVERID2}）。"
+
+#------------------------------------------------------------------------------
+# 第 8b 步：配置强密码策略（ppolicy）
+#------------------------------------------------------------------------------
+log_info "配置 OpenLDAP 强密码策略（ppolicy）..."
+
+# 加载 ppolicy 模块
+cat > /tmp/ppolicy_mod.ldif << EOF
+dn: cn=module{0},cn=config
+changetype: modify
+add: olcModuleLoad
+olcModuleLoad: ppolicy.la
+EOF
+ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/ppolicy_mod.ldif 2>/dev/null || {
+    echo "  (ppolicy 模块可能已加载)"
+}
+
+# 加载 ppolicy schema
+ldapadd -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/ppolicy.ldif 2>/dev/null || true
+
+# 添加 ppolicy overlay 到 hdb 数据库
+cat > /tmp/ppolicy_overlay.ldif << EOF
+dn: olcOverlay=ppolicy,olcDatabase={2}hdb,cn=config
+objectClass: olcOverlayConfig
+objectClass: olcPPolicyConfig
+olcOverlay: ppolicy
+olcPPolicyDefault: ${PPOLICY_DEFAULT_DN}
+olcPPolicyHashCleartext: TRUE
+olcPPolicyUseLockout: FALSE
+EOF
+ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/ppolicy_overlay.ldif 2>/dev/null || {
+    echo "  (ppolicy overlay 可能已存在)"
+}
+
+echo "[OK] 强密码策略（ppolicy）已配置（策略条目从 ldap01 复制）。"
+
+#------------------------------------------------------------------------------
+# 第 9 步：ACL（与主节点保持一致）
+#------------------------------------------------------------------------------
+cat > /tmp/acl.ldif << EOF
+dn: olcDatabase={2}hdb,cn=config
+changetype: modify
+replace: olcAccess
+olcAccess: {0}to attrs=userPassword
+  by self write
+  by dn.base="cn=Manager,${LDAP_SUFFIX}" write
+  by anonymous auth
+  by * none
+olcAccess: {1}to *
+  by self write
+  by dn.base="cn=Manager,${LDAP_SUFFIX}" write
+  by dn.base="cn=${LDAP_RO},${LDAP_SUFFIX}" read
+  by * none
+EOF
+ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/acl.ldif
+echo "[OK] ACL 已配置。"
+
+#------------------------------------------------------------------------------
+# 第 10 步：TLS 配置（使用 replace+add 方式，已验证兼容 OpenLDAP 2.4）
+#------------------------------------------------------------------------------
+if [ "${LDAP_TLS_ENABLED:-yes}" = "yes" ]; then
+    log_info "配置 TLS/SSL..."
+
+    if [ ! -f "${LDAP_TLS_CERT}" ] || [ ! -f "${LDAP_TLS_KEY}" ] || [ ! -f "${LDAP_TLS_CACERT}" ]; then
+        echo "警告: TLS 证书未找到。跳过 TLS 配置。" >&2
+        echo "请从主节点复制证书或运行 server/tls/gen-certs.sh。"
+    else
+        # 修复证书目录权限（ldap 用户需要可访问）
+        getent group ldap &>/dev/null && {
+            chown -R root:ldap "$(dirname "${LDAP_TLS_CERT}")" 2>/dev/null || true
+            chmod 750 "$(dirname "${LDAP_TLS_CERT}")" 2>/dev/null || true
+            chmod 440 "${LDAP_TLS_KEY}" 2>/dev/null || true
+            chmod 444 "${LDAP_TLS_CERT}" "${LDAP_TLS_CACERT}" 2>/dev/null || true
+        }
+
+        # 通过 ldapmodify 更新 TLS 配置（replace 覆盖旧值，add 添加新属性）
+        ldapmodify -Y EXTERNAL -H ldapi:/// << EOFLDIF
+dn: cn=config
+changetype: modify
+replace: olcTLSCertificateFile
+olcTLSCertificateFile: ${LDAP_TLS_CERT}
+-
+replace: olcTLSCertificateKeyFile
+olcTLSCertificateKeyFile: ${LDAP_TLS_KEY}
+-
+add: olcTLSCACertificateFile
+olcTLSCACertificateFile: ${LDAP_TLS_CACERT}
+-
+add: olcTLSCipherSuite
+olcTLSCipherSuite: ${LDAP_TLS_CIPHERS}
+EOFLDIF
+
+        # 更新 SLAPD_URLS 加入 ldaps://
+        [ -f /etc/sysconfig/slapd ] && sed -i 's|^SLAPD_URLS=.*|SLAPD_URLS="ldapi:/// ldap:/// ldaps:///"|' /etc/sysconfig/slapd || true
+        [ -f /etc/default/slapd ] && sed -i 's|^SLAPD_URLS=.*|SLAPD_URLS="ldapi:/// ldap:/// ldaps:///"|' /etc/default/slapd || true
+
+        [ "${OS_VER}" -ge 8 ] 2>/dev/null && {
+            mkdir -p /etc/systemd/system/slapd.service.d
+            cat > /etc/systemd/system/slapd.service.d/override.conf << 'SYSTEMDEOF'
+[Service]
+Environment="SLAPD_URLS=ldapi:/// ldap:/// ldaps:///"
+SYSTEMDEOF
+            systemctl daemon-reload
+        }
+
+        # 配置客户端 ldap.conf TLS
+        sed -i '/^TLS_CACERTDIR/d' /etc/openldap/ldap.conf 2>/dev/null || true
+        grep -q "^TLS_CACERT" /etc/openldap/ldap.conf 2>/dev/null || \
+            echo "TLS_CACERT ${LDAP_TLS_CACERT}" >> /etc/openldap/ldap.conf
+        grep -q "^TLS_REQCERT" /etc/openldap/ldap.conf 2>/dev/null || \
+            echo "TLS_REQCERT demand" >> /etc/openldap/ldap.conf
+
+        echo "[OK] TLS/SSL 已配置（replace+add 方式）。"
+    fi
+fi
+
+#------------------------------------------------------------------------------
+# 第 10b 步：更新 syncrepl 为 ldaps:// 协议
+# 修改 provider URL 从 ldap:// 到 ldaps://，保护复制凭据传输安全
+# 注意：修改后需要重启 slapd 才生效（下一步会重启）
+#------------------------------------------------------------------------------
+if [ "${LDAP_TLS_ENABLED:-yes}" = "yes" ] && [ -f "${LDAP_TLS_CACERT}" ]; then
+    log_info "更新 syncrepl 复制协议为 ldaps://..."
+    python3 -c "
+with open(f'/etc/openldap/slapd.d/cn=config/olcDatabase={{2}}hdb.ldif') as f:
+    content = f.read()
+lines = content.split(chr(10))
+r = []
+for l in lines:
+    if l.startswith(chr(32)):
+        r[-1] += l[1:]
+    else:
+        r.append(l)
+vals = []
+for l in r:
+    if l.startswith('olcSyncrepl:'):
+        vals.append(l.split(': ', 1)[1])
+with open('/tmp/syncrepl-ldaps.ldif', 'w') as f:
+    f.write('dn: olcDatabase={2}hdb,cn=config\nchangetype: modify\n')
+    for v in vals:
+        nv = v.replace('ldap://${LDAP_MASTER1}', 'ldaps://${LDAP_MASTER1}:${LDAPS_PORT}')
+        nv = nv.replace('ldap://${LDAP_MASTER2}', 'ldaps://${LDAP_MASTER2}:${LDAPS_PORT}')
+        f.write(f'delete: olcSyncRepl\nolcSyncRepl: {v}\n-\n')
+        f.write(f'add: olcSyncRepl\nolcSyncRepl: {nv}\n-\n')
+" 2>/dev/null && ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/syncrepl-ldaps.ldif 2>/dev/null && \
+        echo "[OK] syncrepl 已更新为 ldaps://。" || \
+        echo "警告: syncrepl 更新失败，复制将继续使用 ldap://。"
+fi
+
+#------------------------------------------------------------------------------
+# 第 11 步：重启并等待复制
+#------------------------------------------------------------------------------
+log_info "重启 slapd..."
+systemctl restart slapd
+sleep 2
+
+if systemctl is-active --quiet slapd; then
+    echo "[OK] slapd 运行中。"
+else
+    log_error "slapd 启动失败"
+    echo "错误: slapd 启动失败。" >&2
+    systemctl status slapd >&2
+    exit 1
+fi
+
+# 等待从主节点复制数据
+echo "等待从主节点 (${LDAP_MASTER1}) 初始复制..."
+sleep 15
+
+echo -n "验证复制数据... "
+if ldapsearch -x -H "ldap://localhost:${LDAP_PORT}" \
+    -D "cn=Manager,${LDAP_SUFFIX}" -w "${LDAP_ROOTPW}" \
+    -b "${LDAP_SUFFIX}" -s base "(objectClass=*)" dn 2>/dev/null | grep -q "^dn:"; then
+    echo "[OK]"
+else
+    echo "警告: 未找到数据。复制可能仍在进行中。"
+fi
+
+# 清理
+rm -f /tmp/loglevel.ldif /tmp/syncprov_mod.ldif /tmp/olcserverid.ldif \
+      /tmp/configrep.ldif /tmp/syncprov.ldif /tmp/olcdatabasehdb.ldif \
+      /tmp/acl.ldif /tmp/tls.ldif
+
+log_info "LDAP 从节点安装成功完成 $(hostname)。"
+
+echo ""
+echo "========================================"
+echo "  LDAP 从节点安装完成"
+echo "========================================"
+echo ""
+echo "  域:        ${LDAP_SUFFIX}"
+echo "  服务器 ID:  ${LDAP_SERVERID2}"
+echo "  LDAP:       ldap://$(hostname):${LDAP_PORT}"
+if [ "${LDAP_TLS_ENABLED:-yes}" = "yes" ] && [ -f "${LDAP_TLS_CERT}" ]; then
+echo "  LDAPS:      ldaps://$(hostname):${LDAPS_PORT}"
+fi
+echo ""
+echo "验证:"
+echo "  ldapsearch -x -H ldap://localhost -b '${LDAP_SUFFIX}' -D 'cn=Manager,${LDAP_SUFFIX}' -W"

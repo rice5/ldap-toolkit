@@ -1,0 +1,481 @@
+#===============================================================================
+# LDAP 客户端批量部署 Playbook
+# 支持 CentOS 7（nslcd 存量 / SSSD 新装）和 Rocky 8+（仅 SSSD）
+#
+# 先决条件：
+#   1. CA 证书放入 files/ca.crt
+#   2. 只读密码在 group_vars/all.yml 中设置 vault_ldap_ro_pw，chmod 600
+#
+# 用法：
+#   试运行：   ansible-playbook -i hosts deploy-ldap-client.yml -l target --check --diff
+#   单台测试：  ansible-playbook -i hosts deploy-ldap-client.yml -l test-node
+#   按组部署：  ansible-playbook -i hosts deploy-ldap-client.yml -l centos7-sssd
+#   滚动更新：  ansible-playbook -i hosts deploy-ldap-client.yml --serial 10
+#
+# 注意：
+#   - nslcd 模式仅 ldaps://（ssl on 不支持混合 ldap:// + start_tls）
+#   - SSSD 模式配置已精简，对齐 Rocky 8 原始可工作配置
+#   - autofs_ldap_auth.conf 权限必须是 0600
+#===============================================================================
+
+- name: 部署 LDAP 客户端
+  hosts: all
+  become: yes
+  gather_facts: yes
+  serial: "{{ ansible_serial | default(0) }}"   # 0 = 不限制（全部并行），通过 --serial 覆盖
+
+  vars:
+    # 备份目录（含时间戳）
+    backup_dir: "/root/ldap-client-backup.{{ ansible_date_time.epoch }}"
+
+  #------------------------------------------------------------------------------
+  # 预处理：检测节点类型
+  #------------------------------------------------------------------------------
+  pre_tasks:
+    - name: 检测已有 LDAP 客户端类型
+      raw: |
+        if systemctl is-active --quiet sssd 2>/dev/null; then echo sssd;
+        elif systemctl is-active --quiet nslcd 2>/dev/null; then echo nslcd;
+        else echo none; fi
+      register: _existing_client
+      check_mode: no
+      changed_when: false
+      failed_when: false
+
+    - name: 决定部署模式
+      set_fact:
+        _deploy_mode: >-
+          {%- if ldap_client_mode | default('auto') != 'auto' -%}
+            {{ ldap_client_mode }}
+          {%- elif (_existing_client.stdout | default('none')).strip() != 'none' -%}
+            {{ (_existing_client.stdout | default('none')).strip() }}
+          {%- elif ansible_distribution_major_version | int >= 8 -%}
+            sssd
+          {%- else -%}
+            sssd
+          {%- endif -%}
+
+    - name: 显示部署信息
+      debug:
+        msg:
+          - "主机: {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"
+          - "已有客户端: {{ (_existing_client.stdout | default('none')).strip() }}"
+          - "部署模式: {{ _deploy_mode }}"
+          - "LDAP 主: {{ ldap_master1 }}, {{ ldap_master2 }}"
+
+  #=============================================================================
+  # 任务
+  #=============================================================================
+  tasks:
+    #---------------------------------------------------------------------------
+    # 1. 安装软件包
+    #---------------------------------------------------------------------------
+    - name: 安装 LDAP 客户端软件包（通用）
+      package:
+        name:
+          - openldap-clients
+          - ca-certificates
+        state: present
+
+    - name: 安装 SSSD 软件包
+      package:
+        name:
+          - sssd
+          - sssd-ldap
+          - oddjob-mkhomedir
+          - authselect
+          - libsss_sudo
+          - autofs
+        state: present
+      when: _deploy_mode == 'sssd'
+
+    - name: 安装 nslcd 软件包（CentOS 7 存量）
+      package:
+        name:
+          - nss-pam-ldapd
+          - autofs
+        state: present
+      when:
+        - _deploy_mode == 'nslcd'
+        - ansible_distribution_major_version | int < 8
+
+    #---------------------------------------------------------------------------
+    # 2. 部署 CA 证书
+    #---------------------------------------------------------------------------
+    - name: 创建证书目录
+      file:
+        path: /etc/openldap/certs
+        state: directory
+        mode: "0755"
+
+    - name: 部署 CA 证书
+      copy:
+        src: "{{ ldap_tls_cacert_src }}"
+        dest: "{{ ldap_tls_cacert }}"
+        mode: "0444"
+        owner: root
+        group: root
+
+    #---------------------------------------------------------------------------
+    # 3. 配置 /etc/openldap/ldap.conf
+    #---------------------------------------------------------------------------
+    - name: 创建备份目录
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+      when: ansible_check_mode | default(false) == false
+
+    - name: 备份现有 ldap.conf
+      copy:
+        src: /etc/openldap/ldap.conf
+        dest: "{{ backup_dir }}/ldap.conf"
+        remote_src: yes
+      ignore_errors: yes
+      when: ansible_check_mode | default(false) == false
+
+    - name: 写入 /etc/openldap/ldap.conf
+      copy:
+        content: |
+          # LDAP 客户端配置 — 由 Ansible 管理 — {{ ansible_date_time.iso8601 }}
+          BASE    {{ ldap_suffix }}
+          URI     {{ ldap_uris }}
+
+          # TLS（强制验证）
+          TLS_CACERT      {{ ldap_tls_cacert }}
+          TLS_REQCERT     {{ ldap_tls_reqcert }}
+
+          # 超时
+          TIMELIMIT       {{ ldap_timelimit }}
+          TIMEOUT         {{ ldap_timeout }}
+          NETWORK_TIMEOUT {{ ldap_network_timeout }}
+        dest: /etc/openldap/ldap.conf
+        mode: "0644"
+        owner: root
+        group: root
+
+    #---------------------------------------------------------------------------
+    # 4a. 配置 NSLCD（仅 nslcd 模式）
+    #---------------------------------------------------------------------------
+    - name: 备份现有 nslcd.conf
+      copy:
+        src: /etc/nslcd.conf
+        dest: "{{ backup_dir }}/nslcd.conf"
+        remote_src: yes
+      ignore_errors: yes
+      when:
+        - _deploy_mode == 'nslcd'
+        - ansible_check_mode | default(false) == false
+
+    - name: 确保 nslcd 组存在
+      group:
+        name: nslcd
+        state: present
+      when: _deploy_mode == 'nslcd'
+
+    - name: 写入 /etc/nslcd.conf
+      copy:
+        content: |
+          # nslcd 配置 — 由 Ansible 管理 — {{ ansible_date_time.iso8601 }}
+          uid nslcd
+          gid ldap
+
+          uri {{ nslcd_uri }}
+
+          base {{ ldap_suffix }}
+
+          # 只读账号绑定
+          binddn {{ ldap_ro_dn }}
+          bindpw {{ vault_ldap_ro_pw }}
+
+          # TLS（ldaps:// 已加密，不需要 start_tls）
+          ssl on
+          tls_cacertfile {{ ldap_tls_cacert }}
+          tls_reqcert {{ ldap_tls_reqcert }}
+
+          # 超时
+          timelimit 120
+          bind_timelimit 120
+          idle_timelimit 3600
+
+          # 性能
+          threads 5
+
+          # 属性映射
+          map    passwd uid              uid
+          map    passwd homeDirectory    homeDirectory
+          map    passwd gecos            gecos
+          filter passwd (objectClass=posixAccount)
+          map    shadow uid              uid
+          map    group  cn               cn
+        dest: /etc/nslcd.conf
+        mode: "0640"
+        owner: root
+        group: nslcd
+      when: _deploy_mode == 'nslcd'
+
+    - name: 停止 SSSD（nslcd 模式）
+      systemd:
+        name: sssd
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+      when: _deploy_mode == 'nslcd'
+
+    - name: 启动 nslcd
+      systemd:
+        name: nslcd
+        state: restarted
+        enabled: yes
+      when: _deploy_mode == 'nslcd'
+
+    #---------------------------------------------------------------------------
+    # 4b. 配置 SSSD（sssd 模式）
+    #---------------------------------------------------------------------------
+    - name: 停止 nslcd（SSSD 模式）
+      systemd:
+        name: nslcd
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+      when:
+        - _deploy_mode == 'sssd'
+        - ansible_distribution_major_version | int < 8
+
+    - name: 备份现有 sssd.conf
+      copy:
+        src: /etc/sssd/sssd.conf
+        dest: "{{ backup_dir }}/sssd.conf"
+        remote_src: yes
+      ignore_errors: yes
+      when: ansible_check_mode | default(false) == false
+
+    - name: 写入 /etc/sssd/sssd.conf
+      copy:
+        content: |
+          # SSSD 配置 — 由 Ansible 管理 — {{ ansible_date_time.iso8601 }}
+          [sssd]
+          services = nss, pam, autofs, sudo
+          domains = LDAP
+
+          [nss]
+          homedir_substring = {{ sssd_home_base }}
+
+          [pam]
+
+          [sudo]
+
+          [domain/LDAP]
+          id_provider = ldap
+          autofs_provider = ldap
+          auth_provider = ldap
+          sudo_provider = ldap
+
+          ldap_uri = {{ sssd_ldap_uri }}
+          ldap_search_base = {{ ldap_suffix }}
+
+          # 只读账号绑定
+          ldap_default_bind_dn = {{ ldap_ro_dn }}
+          ldap_default_authtok = {{ vault_ldap_ro_pw }}
+
+          # TLS（强制验证）
+          ldap_id_use_start_tls = false
+          ldap_tls_cacert = {{ ldap_tls_cacert }}
+          ldap_tls_reqcert = {{ ldap_tls_reqcert }}
+
+          cache_credentials = true
+
+          # sudo 提供者
+          ldap_sudo_search_base = {{ ldap_sudo_base }}
+
+          # autofs 提供者
+          ldap_autofs_search_base = {{ ldap_suffix }}
+        dest: /etc/sssd/sssd.conf
+        mode: "0600"
+        owner: root
+        group: root
+      when: _deploy_mode == 'sssd'
+
+    - name: 配置 authselect（Rocky 8+）
+      command: authselect select sssd with-mkhomedir with-sudo --force
+      register: _authselect
+      changed_when: "'已存在' not in _authselect.stderr and 'already' not in _authselect.stderr"
+      when:
+        - _deploy_mode == 'sssd'
+        - ansible_distribution_major_version | int >= 8
+
+    - name: 配置 authconfig（CentOS 7）
+      command: authconfig --enablesssd --enablesssdauth --enablemkhomedir --update
+      changed_when: true
+      when:
+        - _deploy_mode == 'sssd'
+        - ansible_distribution_major_version | int < 8
+
+    - name: 启动 oddjobd
+      systemd:
+        name: oddjobd
+        state: restarted
+        enabled: yes
+      when: _deploy_mode == 'sssd'
+
+    - name: 启动 SSSD
+      systemd:
+        name: sssd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+      when: _deploy_mode == 'sssd'
+
+    #---------------------------------------------------------------------------
+    # 5. 配置 autofs
+    #---------------------------------------------------------------------------
+    - name: 配置 automount nsswitch（SSSD 模式）
+      lineinfile:
+        path: /etc/nsswitch.conf
+        line: "automount:  sss files"
+        regexp: '^automount:'
+        state: present
+      when: _deploy_mode == 'sssd'
+
+    - name: 配置 automount nsswitch（nslcd 模式）
+      lineinfile:
+        path: /etc/nsswitch.conf
+        line: "automount:  files ldap"
+        regexp: '^automount:'
+        state: present
+      when: _deploy_mode == 'nslcd'
+
+    - name: 写入 /etc/autofs_ldap_auth.conf
+      copy:
+        content: |
+          <?xml version="1.0" ?>
+          <autofs_ldap_sasl_conf
+              usetls="no"
+              tlsrequired="no"
+              authrequired="simple"
+              user="{{ ldap_ro_dn }}"
+              secret="{{ vault_ldap_ro_pw }}"
+          />
+        dest: /etc/autofs_ldap_auth.conf
+        mode: "0600"
+        owner: root
+        group: root
+
+    - name: 重启 autofs
+      systemd:
+        name: autofs
+        state: restarted
+        enabled: yes
+      ignore_errors: yes
+
+    - name: 安装 pam_pwquality（强密码客户端校验）
+      package:
+        name: libpwquality
+        state: present
+
+    - name: 配置 pam_pwquality 强密码策略
+      copy:
+        content: |
+          # pam_pwquality 强密码策略 — 由 Ansible 管理 — {{ ansible_date_time.iso8601 }}
+          minlen = 8
+          minclass = 3
+          maxrepeat = 2
+          maxsequence = 3
+          dictcheck = 1
+          usercheck = 1
+          enforcing = 1
+        dest: /etc/security/pwquality.conf
+        mode: "0644"
+
+    - name: 确保 pwquality 在 system-auth 中启用
+      lineinfile:
+        path: /etc/pam.d/system-auth
+        regexp: '^password\s+requisite\s+pam_pwquality.so'
+        line: 'password    requisite     pam_pwquality.so retry=3'
+        insertafter: '^password\s+requisite.*pam_pwquality'
+        state: present
+      ignore_errors: yes
+
+    #---------------------------------------------------------------------------
+    # 6. 配置 LDAP sudo
+    #---------------------------------------------------------------------------
+    - name: 配置 sudoers nsswitch（SSSD 模式）
+      lineinfile:
+        path: /etc/nsswitch.conf
+        line: "sudoers:    files sss"
+        regexp: '^sudoers:'
+        state: present
+      when: _deploy_mode == 'sssd'
+
+    - name: 配置 sudoers nsswitch（nslcd 模式）
+      lineinfile:
+        path: /etc/nsswitch.conf
+        line: "sudoers:    files ldap"
+        regexp: '^sudoers:'
+        state: present
+      when: _deploy_mode == 'nslcd'
+
+    - name: 写入 /etc/sudo-ldap.conf
+      copy:
+        content: |
+          # LDAP sudo — 由 Ansible 管理 — {{ ansible_date_time.iso8601 }}
+          URI {{ ldap_uris }}
+          sudoers_base {{ ldap_sudo_base }}
+          binddn {{ ldap_ro_dn }}
+          bindpw {{ vault_ldap_ro_pw }}
+        dest: /etc/sudo-ldap.conf
+        mode: "0440"
+        owner: root
+        group: root
+
+    #---------------------------------------------------------------------------
+    # 7. 配置附加用户组
+    #---------------------------------------------------------------------------
+    - name: 添加用户到附加组
+      user:
+        name: "{{ item.1 }}"
+        groups: "{{ item.0.key }}"
+        append: yes
+      loop: "{{ ldap_extra_groups | dict2items | subelements('value') }}"
+      ignore_errors: yes
+
+    #---------------------------------------------------------------------------
+    # 8. 验证
+    #---------------------------------------------------------------------------
+    - name: 测试 ldaps:// 连接
+      command: |
+        ldapsearch -x -H ldaps://{{ ldap_master1 }}:636 -b "" -s base "(objectClass=*)" dn
+      register: _test_ldaps
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 测试 ldap:// 连接（回退）
+      command: |
+        ldapsearch -x -H ldap://{{ ldap_master1 }}:389 -b "" -s base "(objectClass=*)" dn
+      register: _test_ldap
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 验证本地用户解析
+      command: getent passwd root
+      register: _test_nsswitch
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 验证客户端服务状态
+      systemd:
+        name: "{{ 'sssd' if _deploy_mode == 'sssd' else 'nslcd' }}"
+      register: _service_status
+      changed_when: false
+
+    - name: 报告验证结果
+      debug:
+        msg:
+          - "=========================================="
+          - "验证结果 — {{ inventory_hostname }}"
+          - "=========================================="
+          - "ldaps:// 连接: {{ 'OK' if _test_ldaps.rc == 0 else '失败: ' + _test_ldaps.stderr }}"
+          - "ldap:// 连接:  {{ 'OK' if _test_ldap.rc == 0 else '失败: ' + _test_ldap.stderr }}"
+          - "nsswitch 解析: {{ 'OK' if _test_nsswitch.rc == 0 else '失败' }}"
+          - "{{ _deploy_mode }} 状态: {{ _service_status.status.ActiveState }}"
+          - "备份目录: {{ backup_dir }}"

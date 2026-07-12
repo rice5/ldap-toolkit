@@ -1,0 +1,591 @@
+#!/bin/bash
+#===============================================================================
+# LDAP 客户端部署脚本（优化版）
+# 支持 nslcd（CentOS 7 存量节点）和 SSSD（CentOS 7 + Rocky 8 新节点）
+# 强制启用 ldaps:// TLS 加密，部署 CA 证书。
+#
+# 用法：
+#   方式 1（工具包内）：
+#     source ../config/ldap.conf
+#     ./ldap.client
+#
+#   方式 2（独立运行）：
+#     curl -O http://mirrors.example.com/op/ldap-toolkit.tar.gz
+#     tar zxf ldap-toolkit.tar.gz
+#     cd ldap-toolkit/client
+#     export LDAP_RO_PW="readonly密码"
+#     ./ldap.client
+#
+#   方式 3（仅测试不执行）：
+#     ./ldap.client --dry-run
+#===============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DRY_RUN=false
+CLIENT_MODE="auto"    # auto | nslcd | sssd
+BACKUP_DIR="/root/ldap-client-backup.$(date +%Y%m%d_%H%M%S)"
+
+#------------------------------------------------------------------------------
+# 参数解析
+#------------------------------------------------------------------------------
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)          DRY_RUN=true ;;
+        --mode=*)           CLIENT_MODE="${arg#*=}" ;;
+        --mode)             CLIENT_MODE="$2"; shift ;;
+        -h|--help)
+            echo "用法: $0 [--dry-run] [--mode auto|nslcd|sssd]"
+            echo ""
+            echo "  --dry-run     仅显示将要执行的操作，不实际修改"
+            echo "  --mode auto    自动检测已有客户端类型（默认）"
+            echo "  --mode sssd    强制部署 SSSD（推荐）"
+            echo "  --mode nslcd   强制部署 nslcd（存量兼容）"
+            exit 0
+            ;;
+        *)  echo "未知参数: $arg" >&2; exit 1 ;;
+    esac
+done
+
+#------------------------------------------------------------------------------
+# 加载配置
+#------------------------------------------------------------------------------
+if [ -f "${SCRIPT_DIR}/../config/ldap.conf" ]; then
+    source "${SCRIPT_DIR}/../config/ldap.conf"
+else
+    # 独立运行模式：使用默认值，可用环境变量覆盖
+    export LDAP_DC1="${LDAP_DC1:-example}"
+    export LDAP_DC2="${LDAP_DC2:-hpc}"
+    export LDAP_SUFFIX="${LDAP_SUFFIX:-dc=${LDAP_DC1},dc=${LDAP_DC2}}"
+    export LDAP_MASTER1="${LDAP_MASTER1:-ldap01.example.com}"
+    export LDAP_MASTER2="${LDAP_MASTER2:-ldap02.example.com}"
+    export LDAP_MASTER1_IP="${LDAP_MASTER1_IP:-192.168.1.12}"
+    export LDAP_MASTER2_IP="${LDAP_MASTER2_IP:-192.168.1.13}"
+    export LDAP_PORT="${LDAP_PORT:-389}"
+    export LDAPS_PORT="${LDAPS_PORT:-636}"
+    export LDAP_TLS_CACERT="${LDAP_TLS_CACERT:-/etc/openldap/certs/ca.crt}"
+    export LDAP_TLS_REQCERT="${LDAP_TLS_REQCERT:-demand}"
+    export LDAP_RO="${LDAP_RO:-readonly}"
+    export LDAP_RO_DN="${LDAP_RO_DN:-cn=${LDAP_RO},${LDAP_SUFFIX}}"
+    export LDAP_RO_PW="${LDAP_RO_PW:-}"   # 必须通过环境变量或文件设置
+
+    # 简单日志函数（不依赖 syslog）
+    log_info()  { echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') $*"; }
+    log_error() { echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
+fi
+
+#------------------------------------------------------------------------------
+# 辅助函数
+#------------------------------------------------------------------------------
+
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        local id ver
+        id=$(grep -oP '^ID="?\K[^"]+' /etc/os-release 2>/dev/null || echo "")
+        ver=$(grep -oP 'VERSION_ID="?\K[0-9]+' /etc/os-release 2>/dev/null || echo "0")
+        echo "${id}:${ver}"
+    elif [ -f /etc/redhat-release ]; then
+        local ver
+        ver=$(grep -oP 'release\s+\K\d+' /etc/redhat-release 2>/dev/null || echo "0")
+        echo "centos:${ver}"
+    else
+        echo "unknown:0"
+    fi
+}
+
+detect_client() {
+    # 返回当前运行的 LDAP 客户端类型
+    if systemctl is-active --quiet sssd 2>/dev/null; then
+        echo "sssd"
+    elif systemctl is-active --quiet nslcd 2>/dev/null; then
+        echo "nslcd"
+    else
+        echo "none"
+    fi
+}
+
+get_readonly_pw() {
+    # 优先级：环境变量 > 密码文件 > 交互提示
+    if [ -n "${LDAP_RO_PW:-}" ]; then
+        return
+    fi
+    local pwfile="/root/ldap/.passwdfile_manager"
+    if [ -f "$pwfile" ]; then
+        LDAP_RO_PW=$(cat "$pwfile")
+        return
+    fi
+    # 独立运行时尝试从常见位置读取
+    for f in /root/ldap/.passwdfile_manager /etc/openldap/certs/.roottok; do
+        if [ -f "$f" ]; then
+            LDAP_RO_PW=$(cat "$f")
+            return
+        fi
+    done
+    echo -n "请输入 LDAP 只读账号密码 (cn=readonly): " >&2
+    read -rs LDAP_RO_PW
+    echo "" >&2
+}
+
+backup_file() {
+    local path="$1"
+    if [ -f "$path" ]; then
+        [ "$DRY_RUN" = true ] && { echo "  [DRY-RUN] 备份 $path → ${BACKUP_DIR}/"; return; }
+        mkdir -p "$BACKUP_DIR"
+        cp -a "$path" "${BACKUP_DIR}/$(basename "$path")"
+        echo "  已备份: $path"
+    fi
+}
+
+run_cmd() {
+    if [ "$DRY_RUN" = true ]; then
+        echo "  [DRY-RUN] $*"
+        return 0
+    fi
+    "$@"
+}
+
+#------------------------------------------------------------------------------
+# 主流程
+#------------------------------------------------------------------------------
+
+main() {
+    OS_INFO=$(detect_os)
+    OS_ID="${OS_INFO%%:*}"
+    OS_VER="${OS_INFO##*:}"
+
+    EXISTING_CLIENT=$(detect_client)
+
+    if [ "$CLIENT_MODE" = "auto" ]; then
+        if [ "$EXISTING_CLIENT" != "none" ]; then
+            CLIENT_MODE="$EXISTING_CLIENT"
+        else
+            # 新节点：CentOS 7 默认 SSSD，Rocky 8 强制 SSSD
+            if [ "$OS_VER" -ge 8 ]; then
+                CLIENT_MODE="sssd"
+            else
+                CLIENT_MODE="sssd"  # CentOS 7 新部署也默认 SSSD
+            fi
+        fi
+    fi
+
+    get_readonly_pw
+
+    echo "========================================"
+    echo "  LDAP 客户端部署"
+    echo "========================================"
+    echo "  主机名:     $(hostname)"
+    echo "  操作系统:   ${OS_ID} ${OS_VER}"
+    echo "  当前客户端: ${EXISTING_CLIENT}"
+    echo "  部署模式:   ${CLIENT_MODE}"
+    echo "  LDAP 主:    ${LDAP_MASTER1}, ${LDAP_MASTER2}"
+    echo "  TLS:        demand"
+    echo "  只读账号:   ${LDAP_RO_DN}"
+    echo "  备份目录:   ${BACKUP_DIR}"
+    [ "$DRY_RUN" = true ] && echo "  *** DRY-RUN 模式：不会实际修改 ***"
+    echo "========================================"
+
+    #--------------------------------------------------------------------------
+    # 第 1 步：安装软件包
+    #--------------------------------------------------------------------------
+    log_info "第 1 步：安装软件包..."
+
+    local PKGS="openldap-clients ca-certificates"
+
+    if [ "$CLIENT_MODE" = "sssd" ]; then
+        PKGS="$PKGS sssd sssd-ldap oddjob-mkhomedir"
+        if [ "$OS_VER" -ge 8 ]; then
+            PKGS="$PKGS authselect libsss_sudo"
+        fi
+        if [ "$OS_VER" -eq 7 ]; then
+            PKGS="$PKGS authconfig"
+        fi
+    else
+        PKGS="$PKGS nss-pam-ldapd"
+    fi
+
+    if [ "$DRY_RUN" = false ]; then
+        if [ "$OS_VER" -ge 8 ]; then
+            dnf install -y $PKGS
+        else
+            yum install -y $PKGS
+        fi
+    else
+        echo "  [DRY-RUN] 安装: $PKGS"
+    fi
+    echo "[OK] 软件包安装完成。"
+
+    #--------------------------------------------------------------------------
+    # 第 2 步：部署 CA 证书
+    #--------------------------------------------------------------------------
+    log_info "第 2 步：部署 CA 证书..."
+
+    run_cmd mkdir -p /etc/openldap/certs
+
+    if [ -f "${SCRIPT_DIR}/../server/tls/ca.crt" ]; then
+        run_cmd cp "${SCRIPT_DIR}/../server/tls/ca.crt" "${LDAP_TLS_CACERT}"
+    elif [ -f /opt/ldap-toolkit/server/tls/ca.crt ]; then
+        run_cmd cp /opt/ldap-toolkit/server/tls/ca.crt "${LDAP_TLS_CACERT}"
+    elif [ -f /tmp/ca.crt ]; then
+        run_cmd cp /tmp/ca.crt "${LDAP_TLS_CACERT}"
+    else
+        echo "  警告: 未找到 ca.crt。请将 CA 证书复制到 ${LDAP_TLS_CACERT}"
+        echo "  scp ldap01:/etc/openldap/certs/ca.crt ${LDAP_TLS_CACERT}"
+    fi
+
+    run_cmd chmod 444 "${LDAP_TLS_CACERT}" 2>/dev/null || true
+    echo "[OK] CA 证书已部署。"
+
+    #--------------------------------------------------------------------------
+    # 第 3 步：配置 /etc/openldap/ldap.conf（库级别 TLS）
+    #--------------------------------------------------------------------------
+    log_info "第 3 步：配置 /etc/openldap/ldap.conf..."
+
+    backup_file /etc/openldap/ldap.conf
+
+    local LDAP_URI="ldaps://${LDAP_MASTER1}:${LDAPS_PORT} ldaps://${LDAP_MASTER2}:${LDAPS_PORT} ldap://${LDAP_MASTER1}:${LDAP_PORT} ldap://${LDAP_MASTER2}:${LDAP_PORT}"
+
+    run_cmd tee /etc/openldap/ldap.conf << EOF
+# LDAP 客户端配置 — 由 ldap.client 管理 — $(date '+%Y-%m-%d %H:%M')
+BASE    ${LDAP_SUFFIX}
+URI     ${LDAP_URI}
+
+# TLS（强制验证）
+TLS_CACERT      ${LDAP_TLS_CACERT}
+TLS_REQCERT     ${LDAP_TLS_REQCERT}
+
+# 超时
+TIMELIMIT       120
+TIMEOUT         30
+NETWORK_TIMEOUT 5
+EOF
+    echo "[OK] /etc/openldap/ldap.conf 已配置。"
+
+    #--------------------------------------------------------------------------
+    # 第 4 步：配置 LDAP 客户端（nslcd 或 SSSD）
+    #--------------------------------------------------------------------------
+
+    if [ "$CLIENT_MODE" = "nslcd" ]; then
+        #==========================================================================
+        # NSLCD 模式（CentOS 7 存量节点）
+        #==========================================================================
+        log_info "第 4 步（nslcd）：配置 /etc/nslcd.conf..."
+
+        backup_file /etc/nslcd.conf
+
+        local NSLCD_URI="ldaps://${LDAP_MASTER1}:${LDAPS_PORT} ldaps://${LDAP_MASTER2}:${LDAPS_PORT} ldap://${LDAP_MASTER1}:${LDAP_PORT} ldap://${LDAP_MASTER2}:${LDAP_PORT}"
+
+        run_cmd tee /etc/nslcd.conf << EOF
+# nslcd 配置 — 由 ldap.client 管理 — $(date '+%Y-%m-%d %H:%M')
+uid nslcd
+gid ldap
+
+uri ${NSLCD_URI}
+base ${LDAP_SUFFIX}
+
+# TLS（强制验证）
+ssl start_tls
+tls_cacertfile ${LDAP_TLS_CACERT}
+tls_reqcert ${LDAP_TLS_REQCERT}
+
+# 超时
+timelimit 120
+bind_timelimit 120
+idle_timelimit 3600
+
+# 性能
+threads 5
+
+# 属性映射
+map    passwd uid              uid
+map    passwd homeDirectory    homeDirectory
+map    passwd gecos            gecos
+filter passwd (objectClass=posixAccount)
+map    shadow uid              uid
+map    group  cn               cn
+EOF
+        echo "[OK] /etc/nslcd.conf 已配置。"
+
+        # 停止冲突的 SSSD
+        run_cmd systemctl disable sssd 2>/dev/null || true
+        run_cmd systemctl stop sssd 2>/dev/null || true
+
+        run_cmd systemctl enable nslcd
+        run_cmd systemctl restart nslcd
+
+        if systemctl is-active --quiet nslcd; then
+            echo "[OK] nslcd 运行中。"
+        else
+            log_error "nslcd 启动失败"
+            echo "错误: nslcd 启动失败。请检查 journalctl -u nslcd。" >&2
+        fi
+
+    else
+        #==========================================================================
+        # SSSD 模式（推荐）
+        #==========================================================================
+        log_info "第 4 步（SSSD）：配置 SSSD..."
+
+        # 停止冲突的 nslcd
+        if systemctl is-active --quiet nslcd 2>/dev/null; then
+            log_info "停止旧的 nslcd 服务..."
+            run_cmd systemctl disable nslcd
+            run_cmd systemctl stop nslcd
+        fi
+
+        # 4a. 配置 /etc/sssd/sssd.conf
+        backup_file /etc/sssd/sssd.conf
+
+        local SSSD_URI="ldaps://${LDAP_MASTER1}:${LDAPS_PORT}, ldaps://${LDAP_MASTER2}:${LDAPS_PORT}, ldap://${LDAP_MASTER1}:${LDAP_PORT}, ldap://${LDAP_MASTER2}:${LDAP_PORT}"
+
+        run_cmd tee /etc/sssd/sssd.conf << EOF
+# SSSD 配置 — 由 ldap.client 管理 — $(date '+%Y-%m-%d %H:%M')
+[sssd]
+services = nss, pam, sudo
+domains = LDAP
+
+[nss]
+filter_users = root,ldap,named,avahi,haldaemon,dbus,radiusd,news,nscd
+filter_groups = root
+homedir_substring = /share/home
+
+[pam]
+
+[sudo]
+
+[domain/LDAP]
+id_provider = ldap
+auth_provider = ldap
+access_provider = ldap
+sudo_provider = ldap
+
+ldap_uri = ${SSSD_URI}
+ldap_search_base = ${LDAP_SUFFIX}
+
+# 只读账号绑定
+ldap_default_bind_dn = ${LDAP_RO_DN}
+ldap_default_authtok = ${LDAP_RO_PW}
+
+# TLS（强制验证）
+ldap_id_use_start_tls = false
+ldap_tls_cacert = ${LDAP_TLS_CACERT}
+ldap_tls_reqcert = ${LDAP_TLS_REQCERT}
+
+# Schema
+ldap_schema = rfc2307bis
+ldap_user_uuid = entryuuid
+ldap_group_uuid = entryuuid
+
+# 属性映射
+ldap_user_object_class = posixAccount
+ldap_user_name = uid
+ldap_user_uid_number = uidNumber
+ldap_user_gid_number = gidNumber
+ldap_user_gecos = gecos
+ldap_user_home_directory = homeDirectory
+ldap_user_shell = loginShell
+ldap_group_object_class = posixGroup
+ldap_group_name = cn
+ldap_group_gid_number = gidNumber
+ldap_group_member = memberUid
+
+# 账户过期策略（ShadowAccount）
+ldap_account_expire_policy = shadow
+ldap_pwd_policy = shadow
+
+# 性能
+enumerate = false
+cache_credentials = true
+entry_cache_timeout = 600
+ldap_network_timeout = 5
+ldap_opt_timeout = 10
+
+# sudo 提供者
+ldap_sudo_search_base = ou=sudoers,${LDAP_SUFFIX}
+EOF
+
+        run_cmd chmod 600 /etc/sssd/sssd.conf
+        run_cmd chown root:root /etc/sssd/sssd.conf
+        echo "[OK] /etc/sssd/sssd.conf 已配置。"
+
+        # 4b. 配置认证方式
+        if [ "$OS_VER" -ge 8 ]; then
+            # Rocky 8+ / RHEL 8+：authselect
+            log_info "配置 authselect..."
+            if command -v authselect &>/dev/null; then
+                run_cmd authselect select sssd with-mkhomedir with-sudo --force 2>/dev/null || {
+                    echo "  警告: authselect 失败，尝试降级..."
+                    run_cmd authselect select sssd with-mkhomedir --force 2>/dev/null || true
+                }
+                run_cmd authselect current
+                echo "[OK] authselect 已配置。"
+            fi
+        else
+            # CentOS 7：authconfig
+            log_info "配置 authconfig..."
+            run_cmd authconfig --enablesssd --enablesssdauth --enablemkhomedir --update 2>/dev/null || true
+            echo "[OK] authconfig 已配置。"
+        fi
+
+        # 4c. 启动 SSSD
+        run_cmd systemctl enable oddjobd 2>/dev/null || true
+        run_cmd systemctl restart oddjobd 2>/dev/null || true
+        run_cmd systemctl enable sssd
+        run_cmd systemctl restart sssd
+
+        if systemctl is-active --quiet sssd; then
+            echo "[OK] SSSD 运行中。"
+        else
+            log_error "SSSD 启动失败"
+            echo "错误: SSSD 启动失败。请检查 journalctl -u sssd。" >&2
+            echo "  常见原因:"
+            echo "  1. 网络不通: ping ${LDAP_MASTER1_IP}"
+            echo "  2. CA 证书不存在: ls -la ${LDAP_TLS_CACERT}"
+            echo "  3. 配置语法错误: sssctl config-check"
+        fi
+    fi
+
+    #--------------------------------------------------------------------------
+    # 第 5 步：LDAP sudo 配置
+    #--------------------------------------------------------------------------
+    log_info "第 5 步：配置 LDAP sudo..."
+
+    if [ "$CLIENT_MODE" = "sssd" ]; then
+        # SSSD 模式：sudo 通过 sssd 处理
+        if ! grep -q "^sudoers:" /etc/nsswitch.conf 2>/dev/null; then
+            run_cmd bash -c 'echo "sudoers:    files sss" >> /etc/nsswitch.conf'
+            echo "[OK] sudoers nsswitch 已配置 (sss)。"
+        else
+            echo "[OK] sudoers nsswitch 已存在。"
+        fi
+    else
+        # NSLCD 模式：sudo 通过 sudo-ldap.conf
+        if ! grep -q "^sudoers:" /etc/nsswitch.conf 2>/dev/null; then
+            run_cmd bash -c 'echo "sudoers:    files ldap" >> /etc/nsswitch.conf'
+            echo "[OK] sudoers nsswitch 已配置 (ldap)。"
+        fi
+    fi
+
+    # sudo-ldap.conf（nslcd 模式必需，SSSD 模式可选但保留兼容）
+    backup_file /etc/sudo-ldap.conf
+
+    if ! grep -q "ou=sudoers" /etc/sudo-ldap.conf 2>/dev/null; then
+        run_cmd tee -a /etc/sudo-ldap.conf << EOF
+# LDAP sudo 配置 — 由 ldap.client 管理 — $(date '+%Y-%m-%d %H:%M')
+URI ldaps://${LDAP_MASTER1}:${LDAPS_PORT} ldaps://${LDAP_MASTER2}:${LDAPS_PORT} ldap://${LDAP_MASTER1}:${LDAP_PORT} ldap://${LDAP_MASTER2}:${LDAP_PORT}
+sudoers_base ou=sudoers,${LDAP_SUFFIX}
+binddn ${LDAP_RO_DN}
+bindpw ${LDAP_RO_PW}
+EOF
+        echo "[OK] /etc/sudo-ldap.conf 已配置。"
+    else
+        echo "[OK] /etc/sudo-ldap.conf 已存在，跳过。"
+    fi
+
+    run_cmd chmod 440 /etc/sudo-ldap.conf
+
+    #--------------------------------------------------------------------------
+    # 第 6 步：用户组配置
+    #--------------------------------------------------------------------------
+    log_info "第 6 步：配置用户组..."
+
+    # 将指定用户添加到 dialout 和 rdma 组（如果用户存在）
+    for grp in dialout rdma; do
+        if getent group "$grp" &>/dev/null; then
+            for usr in ic_emu ic_sudoer; do
+                if id "$usr" &>/dev/null; then
+                    if ! id -nG "$usr" | grep -qw "$grp"; then
+                        run_cmd usermod -a -G "$grp" "$usr"
+                        echo "  已添加 $usr → $grp"
+                    fi
+                fi
+            done
+        fi
+    done
+    echo "[OK] 用户组已配置。"
+
+    #--------------------------------------------------------------------------
+    # 第 7 步：验证
+    #--------------------------------------------------------------------------
+    log_info "第 7 步：验证 LDAP 客户端..."
+
+    local FAILS=0
+
+    # 7a. 测试 ldapsearch（ldaps://）
+    echo -n "  测试 ldaps:// 连接... "
+    if ldapsearch -x -H "ldaps://${LDAP_MASTER1}:${LDAPS_PORT}" \
+        -b "" -s base "(objectClass=*)" dn 2>/dev/null | grep -q "^dn:"; then
+        echo "OK"
+    else
+        echo "失败"
+        FAILS=$((FAILS + 1))
+    fi
+
+    # 7b. 测试 ldapsearch（ldap:// 明文回退）
+    echo -n "  测试 ldap:// 连接... "
+    if ldapsearch -x -H "ldap://${LDAP_MASTER1}:${LDAP_PORT}" \
+        -b "" -s base "(objectClass=*)" dn 2>/dev/null | grep -q "^dn:"; then
+        echo "OK"
+    else
+        echo "失败"
+        FAILS=$((FAILS + 1))
+    fi
+
+    # 7c. 测试名称解析
+    echo -n "  测试 nsswitch 名称解析... "
+    if getent passwd root &>/dev/null; then
+        echo "OK（本地用户正常）"
+    else
+        echo "警告（nsswitch 可能未正确配置）"
+    fi
+
+    # 7d. 检查服务状态
+    if [ "$CLIENT_MODE" = "sssd" ]; then
+        echo -n "  测试 SSSD 状态... "
+        if systemctl is-active --quiet sssd; then
+            echo "active"
+        else
+            echo "inactive — 请检查 journalctl -u sssd"
+            FAILS=$((FAILS + 1))
+        fi
+    else
+        echo -n "  测试 nslcd 状态... "
+        if systemctl is-active --quiet nslcd; then
+            echo "active"
+        else
+            echo "inactive — 请检查 journalctl -u nslcd"
+            FAILS=$((FAILS + 1))
+        fi
+    fi
+
+    #--------------------------------------------------------------------------
+    # 完成
+    #--------------------------------------------------------------------------
+    echo ""
+    echo "========================================"
+    if [ $FAILS -gt 0 ]; then
+        echo "  部署完成，但有 ${FAILS} 项验证失败"
+        echo "  备份: ${BACKUP_DIR}"
+        echo "  请检查上述失败项。"
+    else
+        echo "  LDAP 客户端部署成功"
+    fi
+    echo "========================================"
+    echo ""
+    echo "  模式:       ${CLIENT_MODE}"
+    echo "  LDAP 主:    ${LDAP_MASTER1} (ldaps://:${LDAPS_PORT})"
+    echo "               ${LDAP_MASTER2} (ldaps://:${LDAPS_PORT})"
+    echo "  TLS 验证:   ${LDAP_TLS_REQCERT}"
+    echo "  CA 证书:    ${LDAP_TLS_CACERT}"
+    echo ""
+    echo "  验证命令:"
+    echo "    id <用户名>"
+    echo "    getent passwd <用户名>"
+    echo "    ldapsearch -x -H ldaps://${LDAP_MASTER1}:${LDAPS_PORT} -D '${LDAP_RO_DN}' -w '<密码>' -b '${LDAP_SUFFIX}' '(uid=<用户名>)'"
+    echo ""
+    [ "$DRY_RUN" = true ] && echo "  *** 这是 DRY-RUN，未做任何实际修改 ***"
+
+    return $FAILS
+}
+
+main "$@"

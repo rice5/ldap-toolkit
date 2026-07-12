@@ -1,0 +1,138 @@
+#!/bin/bash
+#===============================================================================
+# OpenLDAP Erase/Cleanup Script
+# Safely removes LDAP installation with confirmation and logging.
+#
+# Usage:
+#   ./eraseldap                      # Interactive mode
+#   ./eraseldap --force              # Skip confirmation
+#   ./eraseldap --preserve-config    # Keep cn=config, remove data only
+#===============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -f "${SCRIPT_DIR}/../config/ldap.conf" ]; then
+    source "${SCRIPT_DIR}/../config/ldap.conf"
+else
+    LDAP_SUFFIX="${LDAP_SUFFIX:-dc=unknown}"
+fi
+
+FORCE=false
+PRESERVE_CONFIG=false
+
+usage() {
+    cat << EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Erase LDAP installation from this node.
+
+Options:
+  --force               Skip confirmation prompts
+  --preserve-config     Remove data directories but keep cn=config
+  -h, --help            Show this help
+
+WARNING: This will remove all LDAP data and packages from this node.
+EOF
+    exit 0
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --force)            FORCE=true ;;
+        --preserve-config)  PRESERVE_CONFIG=true ;;
+        -h|--help)          usage ;;
+        *)                  echo "Unknown option: $arg" >&2; usage ;;
+    esac
+done
+
+#------------------------------------------------------------------------------
+# Confirmation
+#------------------------------------------------------------------------------
+if [ "$FORCE" != true ]; then
+    echo "========================================"
+    echo "  WARNING: LDAP Erasure Tool"
+    echo "========================================"
+    echo ""
+    echo "  This will REMOVE:"
+    echo "    - All OpenLDAP RPM packages"
+    echo "    - /etc/openldap/ directory"
+    echo "    - /var/lib/ldap/ directory"
+    echo "    - LDAP Domain: ${LDAP_SUFFIX}"
+    echo ""
+    if [ "$PRESERVE_CONFIG" = true ]; then
+        echo "  Mode: --preserve-config (keeps cn=config)"
+    fi
+    echo ""
+    read -rp "  Type 'yes' to confirm erasure: " CONFIRM
+    if [ "${CONFIRM}" != "yes" ]; then
+        echo "Aborted."
+        exit 0
+    fi
+fi
+
+log_info "Starting LDAP erasure on $(hostname) (domain: ${LDAP_SUFFIX})"
+
+#------------------------------------------------------------------------------
+# Step 1: Stop services
+#------------------------------------------------------------------------------
+echo -n "Stopping LDAP services... "
+systemctl stop slapd 2>/dev/null || true
+systemctl stop nslcd 2>/dev/null || true
+systemctl disable slapd 2>/dev/null || true
+systemctl disable nslcd 2>/dev/null || true
+echo "[OK]"
+
+#------------------------------------------------------------------------------
+# Step 2: Remove packages
+#------------------------------------------------------------------------------
+echo -n "Removing LDAP RPM packages... "
+rpm -qa | grep -iE 'openldap|compat-openldap|nss-pam-ldapd|migrationtools|python-ldap|php-ldap' | \
+    xargs rpm -e --nodeps 2>/dev/null || true
+echo "[OK]"
+
+#------------------------------------------------------------------------------
+# Step 3: Remove data and config
+#------------------------------------------------------------------------------
+if [ "$PRESERVE_CONFIG" = true ]; then
+    echo "Preserving /etc/openldap/slapd.d (cn=config) as requested."
+    if [ -d /var/lib/ldap ]; then
+        echo -n "Removing /var/lib/ldap... "
+        rm -rf /var/lib/ldap
+        echo "[OK]"
+    fi
+else
+    for dir in /etc/openldap /var/lib/ldap; do
+        if [ -d "$dir" ]; then
+            echo -n "Removing ${dir}... "
+            rm -rf "$dir"
+            echo "[OK]"
+        fi
+    done
+fi
+
+#------------------------------------------------------------------------------
+# Step 4: Reinstall bundled RPM (optional)
+#------------------------------------------------------------------------------
+BUNDLED_RPM=$(ls "${SCRIPT_DIR}/openldap-"*.rpm 2>/dev/null | head -1 || true)
+if [ -n "${BUNDLED_RPM}" ] && [ -f "${BUNDLED_RPM}" ]; then
+    echo -n "Reinstalling bundled OpenLDAP RPM: $(basename "${BUNDLED_RPM}")... "
+    rpm -ivh "${BUNDLED_RPM}" 2>/dev/null || echo "WARNING: RPM reinstall failed."
+    echo "[OK]"
+fi
+
+#------------------------------------------------------------------------------
+# Step 5: Restore nsswitch.conf
+#------------------------------------------------------------------------------
+if [ -f /etc/nsswitch.conf.orig ]; then
+    echo -n "Restoring original /etc/nsswitch.conf... "
+    cp /etc/nsswitch.conf.orig /etc/nsswitch.conf
+    echo "[OK]"
+fi
+
+log_info "LDAP erasure completed on $(hostname)."
+echo ""
+echo "LDAP has been removed from this node."
+echo "Domain removed: ${LDAP_SUFFIX}"
+echo "Run ldap.master to reinstall."
