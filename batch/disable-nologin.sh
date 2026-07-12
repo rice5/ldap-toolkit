@@ -49,7 +49,15 @@ export LDAP_RO_PW="$RO_PW"
 
 # 查找 nologin 用户
 echo "正在查找 Shell 为 /sbin/nologin 的用户..."
-NOLOGIN_USERS=$("$QUERY_TOOL" user-list 2>/dev/null | grep nologin | awk '{print $1}' || true)
+set +e
+QUERY_OUTPUT=$("$QUERY_TOOL" user-list 2>/dev/null)
+QUERY_RC=$?
+set -e
+if [ $QUERY_RC -ne 0 ] || [ -z "$QUERY_OUTPUT" ]; then
+    echo "错误: 查询用户列表失败。请检查只读账号密码。" >&2
+    exit 1
+fi
+NOLOGIN_USERS=$(echo "$QUERY_OUTPUT" | grep nologin | awk '{print $1}' || true)
 
 if [ -z "$NOLOGIN_USERS" ]; then
     echo "未找到 nologin 用户。"
@@ -93,7 +101,11 @@ FAILED=0
 
 for uid in "${USER_ARRAY[@]}"; do
     echo -n "  ${uid} ... "
-    if "$ADMIN_TOOL" user mod "$uid" disable 2>&1 | grep -q "已禁用"; then
+    set +e
+    MOD_OUTPUT=$("$ADMIN_TOOL" user mod "$uid" disable 2>&1)
+    MOD_RC=$?
+    set -e
+    if [ $MOD_RC -eq 0 ] && echo "$MOD_OUTPUT" | grep -q "已禁用"; then
         echo "OK"
         SUCCESS=$((SUCCESS + 1))
     else
