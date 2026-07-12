@@ -145,8 +145,8 @@ cd admin
 | action | 说明 | 原理 |
 |--------|------|------|
 | `status` | 查看完整状态 | 显示 DN、UID/GID、密码状态、组成员 |
-| `disable` | 禁用账号 | `shadowExpire = 1` |
-| `enable` | 启用账号 | 删除 `shadowExpire` |
+| `disable` | 禁用账号 | `shadowExpire = 1` + `loginShell = /sbin/nologin` |
+| `enable` | 启用账号 | 删除 `shadowExpire` + 恢复默认 Shell |
 | `lock` | 锁定密码 | `shadowMax = 0` |
 | `unlock` | 解锁密码 | `shadowMax = 90` |
 | `pwd-expire` | 强制下次改密 | `shadowLastChange = 0` |

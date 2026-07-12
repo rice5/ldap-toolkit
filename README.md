@@ -162,8 +162,8 @@ cd admin
 | action | Description | Mechanism |
 |--------|------|------|
 | `status` | Show full status | DN, UID/GID, password state, group memberships |
-| `disable` | Disable account | `shadowExpire = 1` |
-| `enable` | Enable account | Remove `shadowExpire` |
+| `disable` | Disable account | `shadowExpire = 1` + `loginShell = /sbin/nologin` |
+| `enable` | Enable account | Remove `shadowExpire` + restore `loginShell` to default |
 | `lock` | Lock password | `shadowMax = 0` |
 | `unlock` | Unlock password | `shadowMax = 90` |
 | `pwd-expire` | Force password change | `shadowLastChange = 0` |
