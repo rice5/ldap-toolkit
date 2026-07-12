@@ -62,32 +62,35 @@ get_ro_password() {
 #------------------------------------------------------------------------------
 ldap_search() {
     local filter="$1" attrs="$2" base="${3:-$LDAP_SUFFIX}"
-    local result stderr_file rc
+    local result stderr_file pw_file rc
     stderr_file=$(mktemp)
+    pw_file=$(mktemp)
+    # 密码写入临时文件（避免 shell 解释特殊字符）
+    printf '%s' "${LDAP_RO_PW}" > "$pw_file"
 
     for host in "${LDAP_MASTER1}" "${LDAP_MASTER2}"; do
         set +e
         result=$(ldapsearch -x -LLL \
             -H "ldaps://${host}:${LDAPS_PORT}" \
-            -D "${LDAP_RO_DN}" -w "${LDAP_RO_PW}" \
+            -D "${LDAP_RO_DN}" -y "$pw_file" \
             -b "$base" "$filter" $attrs 2>"$stderr_file")
         rc=$?
         set -e
         if [ $rc -eq 0 ]; then
-            rm -f "$stderr_file"
+            rm -f "$stderr_file" "$pw_file"
             echo "$result"
             return 0
         fi
         if grep -qi "invalid credentials\|authentication" "$stderr_file" 2>/dev/null; then
             cat "$stderr_file" >&2 || true
-            rm -f "$stderr_file"
+            rm -f "$stderr_file" "$pw_file"
             die "只读账号认证失败，请检查密码（注意：只读密码 ≠ 管理员密码）。"
         fi
     done
 
     echo "--- ldapsearch stderr ---" >&2
     cat "$stderr_file" >&2 || true
-    rm -f "$stderr_file"
+    rm -f "$stderr_file" "$pw_file"
     die "LDAP 查询失败。请检查: 1) 网络通否 2) CA证书 ${TLS_CACERT} 是否存在"
 }
 
