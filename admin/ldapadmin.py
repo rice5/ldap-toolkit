@@ -547,16 +547,22 @@ class UserManager:
             print(f"错误: 删除用户失败: {e}", file=sys.stderr)
             return 2
 
-    def modify(self, username, action, value=None):
+    def modify(self, username, action, value=None, dry_run=False):
         """修改用户属性"""
         username = validate_username(username)
 
         # 查找用户真实 DN
-        result = self.conn.search(config.search_base, f'(uid={ldap_filter_escape(username)})', ['dn'])
+        result = self.conn.search(config.search_base, f'(uid={ldap_filter_escape(username)})', ['dn', 'loginShell', 'shadowExpire', 'shadowMax'])
         if not result:
             print(f"错误: 用户 '{username}' 未找到。", file=sys.stderr)
             return 2
         user_dn = result[0][0]
+        attrs = result[0][1]
+
+        # dry-run: 打印将要执行的操作
+        if dry_run:
+            self._dry_run_mod(username, user_dn, attrs, action, value)
+            return 0
 
         actions = {
             'enable': lambda: self._set_expire(user_dn, None),
@@ -576,7 +582,40 @@ class UserManager:
 
         return actions[action]()
 
-    def _set_expire(self, dn, days):
+    def _dry_run_mod(self, username, user_dn, attrs, action, value):
+        """dry-run: 显示将要执行的修改操作"""
+        def get_attr(name):
+            val = attrs.get(name, [b''])[0]
+            return val.decode() if val else '-'
+
+        current_expire = get_attr('shadowExpire')
+        current_shell = get_attr('loginShell')
+        current_max = get_attr('shadowMax')
+
+        desc_map = {
+            'enable':     ('启用账号', f'删除 shadowExpire (当前={current_expire}) + 恢复 Shell={config.default_shell}'),
+            'disable':    ('禁用账号', f'shadowExpire=1 + Shell=/sbin/nologin (当前 Shell={current_shell})'),
+            'expire':     ('设置过期', f'shadowExpire={value}'),
+            'lock':       ('锁定密码', f'shadowMax=0 (当前={current_max})'),
+            'unlock':     ('解锁密码', f'shadowMax={config.shadow_max_days} (当前={current_max})'),
+            'pwd-expire': ('强制改密', 'shadowLastChange=0'),
+            'shell':      ('修改 Shell', f'loginShell={value} (当前={current_shell})'),
+            'home':       ('修改家目录', f'homeDirectory={value}'),
+            'status':     ('查看状态', '(只读，不修改)'),
+        }
+
+        desc, detail = desc_map.get(action, (action, str(value)))
+        print()
+        print("┌──────────────────────────────────────────┐")
+        print("│  DRY-RUN 预演 — 将执行以下修改              │")
+        print("├──────────────────────────────────────────┤")
+        print(f"│  用户:           {username}")
+        print(f"│  DN:             {user_dn}")
+        print(f"│  操作:           {desc}")
+        print(f"│  详情:           {detail}")
+        print("└──────────────────────────────────────────┘")
+        print()
+        print("提示: 去掉 --dry-run / -n 参数以实际执行。")
         """设置/移除 shadowExpire，同时修改 loginShell"""
         if days is None:
             self.conn.modify(dn, [
@@ -1090,6 +1129,7 @@ def build_parser():
     ua_mod.add_argument('action', choices=['enable', 'disable', 'expire', 'expire-date', 'max-days', 'lock', 'unlock', 'pwd-expire', 'shell', 'home', 'status'],
                         help='操作: enable/disable/expire/lock/unlock/pwd-expire/shell/home/status')
     ua_mod.add_argument('value', nargs='?', help='操作参数（如 shell 路径、家目录、过期日期 YYYY-MM-DD）')
+    ua_mod.add_argument('--dry-run', '-n', action='store_true', help='预演模式：仅显示将要修改的信息，不实际写入 LDAP')
 
     # ── user del ──
     ua_del = ua.add_parser('del', help='删除用户')
@@ -1189,7 +1229,7 @@ def main():
                               ou=args.ou or '',
                               dry_run=args.dry_run)
             elif args.subcommand == 'mod':
-                return um.modify(args.username, args.action, args.value)
+                return um.modify(args.username, args.action, args.value, dry_run=args.dry_run)
             elif args.subcommand == 'del':
                 return um.delete(args.username, force=args.force,
                                  remove_groups=args.remove_groups,
