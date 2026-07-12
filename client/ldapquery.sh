@@ -25,6 +25,7 @@ LDAPS_PORT="${LDAPS_PORT:-636}"
 LDAP_SUFFIX="${LDAP_SUFFIX:-dc=example,dc=com}"
 LDAP_RO_DN="${LDAP_RO_DN:-cn=readonly,${LDAP_SUFFIX}}"
 LDAP_RO_PW="${LDAP_RO_PW:-}"
+TLS_CACERT="${TLS_CACERT:-/etc/openldap/certs/ca.crt}"
 
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
