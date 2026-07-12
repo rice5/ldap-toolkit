@@ -62,29 +62,33 @@ get_ro_password() {
 #------------------------------------------------------------------------------
 ldap_search() {
     local filter="$1" attrs="$2" base="${3:-$LDAP_SUFFIX}"
-    local result stderr_file
+    local result stderr_file rc
     stderr_file=$(mktemp)
 
     for host in "${LDAP_MASTER1}" "${LDAP_MASTER2}"; do
-        # shellcheck disable=SC2086
+        set +e
         result=$(ldapsearch -x -LLL \
             -H "ldaps://${host}:${LDAPS_PORT}" \
             -D "${LDAP_RO_DN}" -w "${LDAP_RO_PW}" \
-            -b "$base" "$filter" $attrs 2>"$stderr_file") && {
+            -b "$base" "$filter" $attrs 2>"$stderr_file")
+        rc=$?
+        set -e
+        if [ $rc -eq 0 ]; then
             rm -f "$stderr_file"
             echo "$result"
             return 0
-        }
+        fi
         if grep -qi "invalid credentials\|authentication" "$stderr_file" 2>/dev/null; then
-            cat "$stderr_file" >&2
+            cat "$stderr_file" >&2 || true
             rm -f "$stderr_file"
-            die "只读账号认证失败，请检查密码。"
+            die "只读账号认证失败，请检查密码（注意：只读密码 ≠ 管理员密码）。"
         fi
     done
 
-    cat "$stderr_file" >&2
+    echo "--- ldapsearch stderr ---" >&2
+    cat "$stderr_file" >&2 || true
     rm -f "$stderr_file"
-    die "LDAP 查询失败。请检查网络和 CA 证书。"
+    die "LDAP 查询失败。请检查: 1) 网络通否 2) CA证书 ${TLS_CACERT} 是否存在"
 }
 
 epoch_to_date() {

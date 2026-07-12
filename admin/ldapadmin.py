@@ -616,6 +616,8 @@ class UserManager:
         print("└──────────────────────────────────────────┘")
         print()
         print("提示: 去掉 --dry-run / -n 参数以实际执行。")
+
+    def _set_expire(self, dn, days):
         """设置/移除 shadowExpire，同时修改 loginShell"""
         if days is None:
             self.conn.modify(dn, [
