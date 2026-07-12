@@ -54,7 +54,9 @@ get_ro_password() {
     echo -n "请输入 LDAP 只读账号密码 (cn=readonly): " >&2
     read -rs LDAP_RO_PW
     echo "" >&2
-    [ -z "${LDAP_RO_PW}" ] && die "需要只读账号密码才能查询。"
+    if [ -z "${LDAP_RO_PW}" ]; then
+        die "需要只读账号密码才能查询。"
+    fi
 }
 
 #------------------------------------------------------------------------------
