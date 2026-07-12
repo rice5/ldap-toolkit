@@ -10,3 +10,4 @@ CLAUDE_CN.md
 admin/__pycache__/
 *.pyc
 _update_readme.py
+tools/git-secrets-hook.sh
