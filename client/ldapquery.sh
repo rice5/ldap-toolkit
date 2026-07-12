@@ -64,9 +64,11 @@ ldap_search() {
     local filter="$1" attrs="$2" base="${3:-$LDAP_SUFFIX}"
     local result stderr_file pw_file rc
     stderr_file=$(mktemp)
+    # 密码临时文件: mktemp 默认 600，用完立即删除，不会泄露
     pw_file=$(mktemp)
-    # 密码写入临时文件（避免 shell 解释特殊字符）
     printf '%s' "${LDAP_RO_PW}" > "$pw_file"
+    # 确保只有当前用户可读
+    chmod 600 "$pw_file" 2>/dev/null || true
 
     for host in "${LDAP_MASTER1}" "${LDAP_MASTER2}"; do
         set +e
