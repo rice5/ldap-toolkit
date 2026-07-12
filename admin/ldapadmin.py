@@ -44,26 +44,39 @@ except ImportError:
 #------------------------------------------------------------------------------
 
 class Config:
-    """LDAP 配置管理"""
+    """LDAP 配置管理
+
+    所有值均可通过环境变量覆盖，默认值为示例占位符。
+    生产部署前需设置以下核心变量（或通过 config/ldap.conf 统一覆盖）：
+
+        export LDAP_DC1=your_domain      # ★ 替换 example
+        export LDAP_DC2=your_tld         # ★ 替换 com
+        export LDAP_MASTER1=ldap01.your.domain  # ★ 替换服务器地址
+        export LDAP_MASTER2=ldap02.your.domain
+        export LDAP_ROOTPW='your_manager_password'
+        export LDAP_RO_PW='your_readonly_password'
+    """
 
     def __init__(self):
+        # ── ★ 部署前必须修改的变量 ──
         # LDAP 域
-        self.dc1 = os.environ.get('LDAP_DC1', 'example')
-        self.dc2 = os.environ.get('LDAP_DC2', 'com')
+        self.dc1 = os.environ.get('LDAP_DC1', 'example')       # ★ 改为你的 dc1
+        self.dc2 = os.environ.get('LDAP_DC2', 'com')           # ★ 改为你的 dc2
         self.suffix = os.environ.get('LDAP_SUFFIX', f'dc={self.dc1},dc={self.dc2}')
         self.root_dn = os.environ.get('LDAP_ROOTDN', f'cn=Manager,{self.suffix}')
-        self.root_pw = os.environ.get('LDAP_ROOTPW', '')
+        self.root_pw = os.environ.get('LDAP_ROOTPW', '')       # ★ 设置管理员密码
 
         # 只读账号
         self.ro_user = os.environ.get('LDAP_RO', 'readonly')
         self.ro_dn = os.environ.get('LDAP_RO_DN', f'cn={self.ro_user},{self.suffix}')
-        self.ro_pw = os.environ.get('LDAP_RO_PW', '')
+        self.ro_pw = os.environ.get('LDAP_RO_PW', '')          # ★ 设置只读密码
 
         # 服务器
-        self.master1 = os.environ.get('LDAP_MASTER1', 'ldap01.example.com')
-        self.master2 = os.environ.get('LDAP_MASTER2', 'ldap02.example.com')
+        self.master1 = os.environ.get('LDAP_MASTER1', 'ldap01.example.com')  # ★ 改为实际地址
+        self.master2 = os.environ.get('LDAP_MASTER2', 'ldap02.example.com')  # ★ 改为实际地址
         self.ldaps_port = int(os.environ.get('LDAPS_PORT', '636'))
 
+        # ── 通常无需修改 ──
         # TLS
         self.tls_enabled = os.environ.get('LDAP_TLS_ENABLED', 'yes') == 'yes'
         self.tls_cacert = os.environ.get('LDAP_TLS_CACERT', '/etc/openldap/certs/ca.crt')
@@ -72,19 +85,19 @@ class Config:
         # DIT
         self.user_base = os.environ.get('LDAP_USER_BASE', f'ou=People,{self.suffix}')
         self.group_base = os.environ.get('LDAP_GROUP_BASE', f'ou=Group,{self.suffix}')
-        self.search_base = self.suffix  # 搜索范围覆盖全部 OU
+        self.search_base = self.suffix
 
-        # 默认值
-        self.default_shell = os.environ.get('DEFAULT_LOGIN_SHELL', '/bin/csh')
-        self.default_home_base = os.environ.get('DEFAULT_HOME_BASE', '/share/home')
-        self.uid_min = int(os.environ.get('DEFAULT_UID_MIN', '5000'))
+        # 默认值（★ 可按需修改）
+        self.default_shell = os.environ.get('DEFAULT_LOGIN_SHELL', '/bin/csh')     # ★ 默认 Shell
+        self.default_home_base = os.environ.get('DEFAULT_HOME_BASE', '/share/home') # ★ 家目录前缀
+        self.uid_min = int(os.environ.get('DEFAULT_UID_MIN', '5000'))               # ★ UID/GID 起点
         self.gid_min = int(os.environ.get('DEFAULT_GID_MIN', '5000'))
 
         # 密码策略
         self.password_min_length = int(os.environ.get('PASSWORD_MIN_LENGTH', '8'))
-        self.shadow_max_days = int(os.environ.get('SHADOW_MAX_DAYS', '90'))
-        self.shadow_warn_days = int(os.environ.get('SHADOW_WARN_DAYS', '7'))
-        self.shadow_inactive = int(os.environ.get('SHADOW_INACTIVE', '30'))
+        self.shadow_max_days = int(os.environ.get('SHADOW_MAX_DAYS', '90'))          # 密码有效期（天）
+        self.shadow_warn_days = int(os.environ.get('SHADOW_WARN_DAYS', '7'))         # 过期前警告（天）
+        self.shadow_inactive = int(os.environ.get('SHADOW_INACTIVE', '30'))           # 宽限期（天）
 
 
 config = Config()
@@ -564,14 +577,20 @@ class UserManager:
         return actions[action]()
 
     def _set_expire(self, dn, days):
-        """设置/移除 shadowExpire"""
+        """设置/移除 shadowExpire，同时修改 loginShell"""
         if days is None:
-            self.conn.modify(dn, [(ldap.MOD_DELETE, 'shadowExpire', None)])
-            print("账号已启用。")
+            self.conn.modify(dn, [
+                (ldap.MOD_DELETE, 'shadowExpire', None),
+                (ldap.MOD_REPLACE, 'loginShell', config.default_shell.encode()),
+            ])
+            print("账号已启用（Shell 已恢复为默认）。")
         else:
-            self.conn.modify(dn, [(ldap.MOD_REPLACE, 'shadowExpire', str(days).encode())])
-            print("账号已禁用。")
-        logging.info(f"Account modify: {dn} shadowExpire={days}")
+            self.conn.modify(dn, [
+                (ldap.MOD_REPLACE, 'shadowExpire', str(days).encode()),
+                (ldap.MOD_REPLACE, 'loginShell', b'/sbin/nologin'),
+            ])
+            print("账号已禁用（Shell 已设为 /sbin/nologin）。")
+        logging.info(f"Account expire: {dn} shadowExpire={days}")
         return 0
 
     def _set_expire_date(self, dn, date_str):
