@@ -33,7 +33,9 @@ OpenLDAP multi-master mirror mode deployment toolkit for RHEL/CentOS 7 (compatib
 ### 1. Configuration
 
 ```bash
-vi config/ldap.conf
+vi config/ldap.conf.example
+# Copy to ldap.conf and fill in your values:
+cp config/ldap.conf.example config/ldap.conf
 ```
 
 All values are set via environment variables with safe defaults. Override for your environment:

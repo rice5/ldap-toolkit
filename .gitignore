@@ -2,6 +2,7 @@
 ldap_certs/
 ansible/files/ca.crt
 ansible/group_vars/all.yml
+config/ldap.conf
 
 # Local tooling — not for public repo
 .claude/

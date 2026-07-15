@@ -33,7 +33,8 @@ OpenLDAP 多主镜像模式部署工具包，适用于 RHEL/CentOS 7（兼容 8/
 ### 1. 配置
 
 ```bash
-# 编辑配置文件
+# 复制示例配置，填入真实值
+cp config/ldap.conf.example config/ldap.conf
 vi config/ldap.conf
 
 # 必须设置的变量：
