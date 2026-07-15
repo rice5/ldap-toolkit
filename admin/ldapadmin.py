@@ -90,6 +90,7 @@ class Config:
         # 默认值（★ 可按需修改）
         self.default_shell = os.environ.get('DEFAULT_LOGIN_SHELL', '/bin/csh')     # ★ 默认 Shell
         self.default_home_base = os.environ.get('DEFAULT_HOME_BASE', '/share/home') # ★ 家目录前缀
+        self.mail_domain = os.environ.get('LDAP_MAIL_DOMAIN', 'example.com')       # ★ 邮箱域名
         self.uid_min = int(os.environ.get('DEFAULT_UID_MIN', '5000'))               # ★ UID/GID 起点
         self.gid_min = int(os.environ.get('DEFAULT_GID_MIN', '5000'))
 
@@ -329,7 +330,7 @@ class UserManager:
         gid = kwargs.get('gid', 0)
         mail = kwargs.get('mail')
         if mail is None:
-            mail = f'{username}@example.com'
+            mail = f'{username}@{config.mail_domain}'
         phone = kwargs.get('phone', '')
         disabled = kwargs.get('disabled', False)
         must_change = kwargs.get('must_change', False)
@@ -1117,7 +1118,7 @@ def build_parser():
     ua_add.add_argument('--uid', '-u', type=int, default=0, help='指定 UID（0=自动分配）')
     ua_add.add_argument('--gid', type=int, default=0, help='指定 GID（0=自动分配）')
     ua_add.add_argument('--ou', help='所属 OU（如 rd, dv, sw，默认: People）')
-    ua_add.add_argument('--mail', '-m', help='邮箱（默认: <uid>@example.com，传空字符串则不设置）')
+    ua_add.add_argument('--mail', '-m', help='邮箱（默认: <uid>@${LDAP_MAIL_DOMAIN}，传空字符串则不设置）')
     ua_add.add_argument('--phone', '-t', help='电话号码')
     ua_add.add_argument('--disabled', action='store_true', help='创建为禁用状态')
     ua_add.add_argument('--must-change', action='store_true', help='首次登录强制修改密码')
