@@ -265,6 +265,57 @@ cp -r web/selfservice/* /opt/ldap-selfservice/
 systemctl restart httpd24-httpd
 ```
 
+## Password Expiry Statistics & Notification
+
+> Every day at 09:00, automatically scans users whose password expires within 15 days, sends a summary to IT, and notifies each affected user.
+
+### Features
+
+1. **Summary email** to `ADMIN_TO` (IT), cc `ADMIN_CC`, listing username / email / last change / expiry / days remaining.
+2. **Notification email** to each expiring user, with two password-change methods (Exceed TurboX → `passwd`, or self-service portal `SELF_SERVICE_URL` → "LDAP Account").
+
+### Files
+
+| File | Purpose |
+|------|------|
+| `admin/password_expiry_notify.py` | Main script (Python3 stdlib + system ldapsearch, no third-party deps) |
+| `config/password_expiry_notify.env` | Actual config (LDAP RO password + SMTP password, chmod 600, git-ignored) |
+| `config/password_expiry_notify.env.example` | Config template |
+
+### Usage
+
+```bash
+cd admin
+
+# Preview (no email)
+./password_expiry_notify.py --dry-run
+
+# Send normally
+./password_expiry_notify.py
+
+# Summary only
+./password_expiry_notify.py --send-summary-only
+
+# Test: redirect notification to a specific address
+./password_expiry_notify.py --test-email you@example.com
+
+# Override threshold days (default 15)
+./password_expiry_notify.py --days 45 --dry-run
+```
+
+### Cron
+
+```bash
+crontab -e
+0 9 * * * /usr/bin/python3.12 /home/root1/projects/ldap/admin/password_expiry_notify.py >> /home/root1/projects/ldap/logs/password_expiry_notify.log 2>&1
+```
+
+### Expiry Calculation
+
+- Based on ShadowAccount: `shadowLastChange` (epoch days) + `shadowMax` (90 days) = expiry date.
+- `shadowMax=0` or missing attributes → treated as never-expire / uncomputable, skipped.
+- Only users expiring within the next N days are counted (already-expired negative days excluded).
+
 ## Directory Structure
 
 ```
@@ -287,7 +338,8 @@ systemctl restart httpd24-httpd
 │   ├── ldap.client              # Single-host shell deployment (fallback)
 │   └── ldapquery.sh             # Client query tool (bash + ldapsearch)
 ├── admin/
-│   └── ldapadmin.py             # Unified management CLI (user/group/batch/automount)
+│   ├── ldapadmin.py             # Unified management CLI (user/group/batch/automount)
+│   └── password_expiry_notify.py # Password expiry scan & notification (daily 09:00)
 ├── batch/
 │   ├── addjaguar.sh             # Batch user import
 │   └── deljaguar.sh             # Batch user delete

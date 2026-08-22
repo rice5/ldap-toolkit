@@ -249,6 +249,57 @@ cp -r web/selfservice/* /opt/ldap-selfservice/
 systemctl restart httpd24-httpd
 ```
 
+## 密码过期统计与通知
+
+> 每天 9:00 自动统计未来 15 天内密码过期的用户，发汇总邮件给 IT，并逐一向用户发通知邮件。
+
+### 功能
+
+1. **汇总邮件**：发送到 IT 邮箱（`ADMIN_TO`），抄送 `ADMIN_CC`，表格列出每个即将过期用户的用户名、邮箱、最后改密时间、密码过期时间、剩余天数。
+2. **通知邮件**：分别发送给每个即将过期的用户，告知两种改密方式（ETX 登录 Linux 后 `passwd`，或自助网站 `SELF_SERVICE_URL` 选择目录服务 "LDAP Account"）。
+
+### 文件
+
+| 文件 | 用途 |
+|------|------|
+| `admin/password_expiry_notify.py` | 主脚本（Python3 标准库 + 系统 ldapsearch，无第三方依赖） |
+| `config/password_expiry_notify.env` | 实际配置（含 LDAP 只读密码 + SMTP 密码，chmod 600，git 忽略） |
+| `config/password_expiry_notify.env.example` | 配置模板 |
+
+### 使用
+
+```bash
+cd admin
+
+# 预演（不发邮件）
+./password_expiry_notify.py --dry-run
+
+# 正常发送
+./password_expiry_notify.py
+
+# 只发汇总、不发用户通知
+./password_expiry_notify.py --send-summary-only
+
+# 测试：通知邮件改发到指定邮箱
+./password_expiry_notify.py --test-email you@example.com
+
+# 临时调整阈值天数（默认 15）
+./password_expiry_notify.py --days 45 --dry-run
+```
+
+### 定时任务
+
+```bash
+crontab -e
+0 9 * * * /usr/bin/python3.12 /home/root1/projects/ldap/admin/password_expiry_notify.py >> /home/root1/projects/ldap/logs/password_expiry_notify.log 2>&1
+```
+
+### 密码过期计算规则
+
+- 依据 ShadowAccount：`shadowLastChange`（最后改密的 epoch 天数）+ `shadowMax`（90 天）得到过期日。
+- `shadowMax=0` 或属性缺失视为永不过期/无法计算，自动跳过。
+- 仅统计「未来 N 天内」过期的用户（已过期的负数天数不计入）。
+
 ## 目录结构
 
 ```
@@ -271,7 +322,8 @@ D:/workspace/ldap/
 │   ├── ldap.client              # 单机 Shell 部署（备选）
 │   └── ldapquery.sh             # 客户端查询工具（普通用户可用）
 ├── admin/
-│   └── ldapadmin.py            # 统一管理工具: user/group/batch/automount
+│   ├── ldapadmin.py            # 统一管理工具: user/group/batch/automount
+│   └── password_expiry_notify.py  # 密码过期统计与通知（每天9点自动）
 ├── batch/
 │   ├── addjaguar.sh            # 批量用户导入
 │   └── deljaguar.sh            # 批量用户删除
