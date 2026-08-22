@@ -271,7 +271,7 @@ systemctl restart httpd24-httpd
 
 ### Features
 
-1. **Summary email** to `ADMIN_TO` (IT), cc `ADMIN_CC`, listing username / email / last change / expiry / days remaining.
+1. **Summary email** to `ADMIN_TO` (IT), cc `ADMIN_CC` (comma-separated, multiple allowed), listing username / email / last change / expiry / days remaining.
 2. **Notification email** to each expiring user, with two password-change methods (Exceed TurboX → `passwd`, or self-service portal `SELF_SERVICE_URL` → "LDAP Account").
 
 ### Files
@@ -279,6 +279,7 @@ systemctl restart httpd24-httpd
 | File | Purpose |
 |------|------|
 | `admin/password_expiry_notify.py` | Main script (Python3 stdlib + system ldapsearch, no third-party deps) |
+| `admin/password_expiry_cron.sh` | Cron entry point (silent, alerts on failure) |
 | `config/password_expiry_notify.env` | Actual config (LDAP RO password + SMTP password, chmod 600, git-ignored) |
 | `config/password_expiry_notify.env.example` | Config template |
 
@@ -305,10 +306,15 @@ cd admin
 
 ### Cron
 
+Use `admin/password_expiry_cron.sh` as the scheduled entry point (silent on success, logs to file; returns non-zero and prints an error summary on failure for alerting). Works with system crontab or hermes cron:
+
 ```bash
+# System crontab (daily 09:00)
 crontab -e
-0 9 * * * /usr/bin/python3.12 /home/root1/projects/ldap/admin/password_expiry_notify.py >> /home/root1/projects/ldap/logs/password_expiry_notify.log 2>&1
+0 9 * * * /path/to/ldap/admin/password_expiry_cron.sh
 ```
+
+Production here is scheduled via hermes cron (no_agent mode, daily 09:00; the script itself sends the emails).
 
 ### Expiry Calculation
 
@@ -339,7 +345,8 @@ crontab -e
 │   └── ldapquery.sh             # Client query tool (bash + ldapsearch)
 ├── admin/
 │   ├── ldapadmin.py             # Unified management CLI (user/group/batch/automount)
-│   └── password_expiry_notify.py # Password expiry scan & notification (daily 09:00)
+│   ├── password_expiry_notify.py # Password expiry scan & notification (daily 09:00)
+│   └── password_expiry_cron.sh   # Cron entry point (silent, alerts on failure)
 ├── batch/
 │   ├── addjaguar.sh             # Batch user import
 │   └── deljaguar.sh             # Batch user delete

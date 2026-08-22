@@ -428,13 +428,15 @@ def main():
         print(render_summary(expiring, cfg))
         return 0
 
-    # 功能1：汇总邮件给 IT
+    # 功能1：汇总邮件给 IT（ADMIN_TO / ADMIN_CC 均支持逗号分隔多个收件人）
+    admin_to = [x.strip() for x in cfg['ADMIN_TO'].split(',') if x.strip()]
+    admin_cc = [x.strip() for x in cfg['ADMIN_CC'].split(',') if x.strip()]
     subject_summary = f'[LDAP密码过期统计] 未来{notify_days}天内 {len(expiring)} 个用户密码将过期'
     body_summary = render_summary(expiring, cfg)
-    LOG.info(f'发送汇总邮件 -> {cfg["ADMIN_TO"]} (cc {cfg["ADMIN_CC"]})')
+    LOG.info(f'发送汇总邮件 -> {", ".join(admin_to)} (cc {", ".join(admin_cc)})')
     if not args.dry_run:
-        ok, errs = send_mail(cfg, [cfg['ADMIN_TO']], subject_summary,
-                             body_summary, cc_addrs=[cfg['ADMIN_CC']] if cfg['ADMIN_CC'] else None)
+        ok, errs = send_mail(cfg, admin_to, subject_summary,
+                             body_summary, cc_addrs=admin_cc or None)
         if errs:
             LOG.error(f'汇总邮件发送失败: {errs}')
         else:

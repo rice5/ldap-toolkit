@@ -255,7 +255,7 @@ systemctl restart httpd24-httpd
 
 ### 功能
 
-1. **汇总邮件**：发送到 IT 邮箱（`ADMIN_TO`），抄送 `ADMIN_CC`，表格列出每个即将过期用户的用户名、邮箱、最后改密时间、密码过期时间、剩余天数。
+1. **汇总邮件**：发送到 IT 邮箱（`ADMIN_TO`），抄送 `ADMIN_CC`（支持逗号分隔多个邮箱），表格列出每个即将过期用户的用户名、邮箱、最后改密时间、密码过期时间、剩余天数。
 2. **通知邮件**：分别发送给每个即将过期的用户，告知两种改密方式（ETX 登录 Linux 后 `passwd`，或自助网站 `SELF_SERVICE_URL` 选择目录服务 "LDAP Account"）。
 
 ### 文件
@@ -263,6 +263,7 @@ systemctl restart httpd24-httpd
 | 文件 | 用途 |
 |------|------|
 | `admin/password_expiry_notify.py` | 主脚本（Python3 标准库 + 系统 ldapsearch，无第三方依赖） |
+| `admin/password_expiry_cron.sh` | 定时任务入口（静默执行、出错告警） |
 | `config/password_expiry_notify.env` | 实际配置（含 LDAP 只读密码 + SMTP 密码，chmod 600，git 忽略） |
 | `config/password_expiry_notify.env.example` | 配置模板 |
 
@@ -289,10 +290,15 @@ cd admin
 
 ### 定时任务
 
+推荐用 `admin/password_expiry_cron.sh` 作为定时入口（正常执行静默、输出写日志；出错返回非零退出码并输出错误摘要，便于监控告警），可挂到系统 crontab 或 hermes cron：
+
 ```bash
+# 系统 crontab（每天 9:00）
 crontab -e
-0 9 * * * /usr/bin/python3.12 /home/root1/projects/ldap/admin/password_expiry_notify.py >> /home/root1/projects/ldap/logs/password_expiry_notify.log 2>&1
+0 9 * * * /path/to/ldap/admin/password_expiry_cron.sh
 ```
+
+本机生产环境通过 hermes cron 调度（no_agent 模式，每天 9:00 触发，脚本自身负责发邮件）。
 
 ### 密码过期计算规则
 
@@ -323,7 +329,8 @@ D:/workspace/ldap/
 │   └── ldapquery.sh             # 客户端查询工具（普通用户可用）
 ├── admin/
 │   ├── ldapadmin.py            # 统一管理工具: user/group/batch/automount
-│   └── password_expiry_notify.py  # 密码过期统计与通知（每天9点自动）
+│   ├── password_expiry_notify.py  # 密码过期统计与通知（每天9点自动）
+│   └── password_expiry_cron.sh    # 定时任务入口（静默执行，出错告警）
 ├── batch/
 │   ├── addjaguar.sh            # 批量用户导入
 │   └── deljaguar.sh            # 批量用户删除
