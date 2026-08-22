@@ -99,13 +99,13 @@ Alias /ldapadmin /usr/share/phpldapadmin/htdocs
 <Directory /usr/share/phpldapadmin/htdocs>
   <IfModule mod_authz_core.c>
     # Apache 2.4
-    Require ip 127.0.0.1 ::1 10.1.10.0/24
+    Require ip 127.0.0.1 ::1 192.0.2.0/24
   </IfModule>
   <IfModule !mod_authz_core.c>
     # Apache 2.2
     Order Deny,Allow
     Deny from all
-    Allow from 127.0.0.1 ::1 10.1.10.0/24
+    Allow from 127.0.0.1 ::1 192.0.2.0/24
   </IfModule>
 </Directory>
 ```
@@ -168,6 +168,6 @@ systemctl restart httpd24   # 或 apachectl restart
 | 页面 404 | Apache Alias 未配置 | 检查 `/opt/rh/httpd24/root/etc/httpd/conf.d/phpldapadmin.conf` |
 | 页面 403 | IP 限制 | 检查 Require ip 配置，确认客户端 IP 在白名单内 |
 | 无 Server Select 下拉框 | config.php 只配了一个 server | 确保有两个 `$servers->newServer('ldap_pla')` 块 |
-| "Can't contact LDAP server" | 网络不通或端口错误 | `ldapsearch -H ldap://192.168.1.12 -x -b "" -s base` 测试 |
+| "Can't contact LDAP server" | 网络不通或端口错误 | `ldapsearch -H ldap://192.0.2.12 -x -b "" -s base` 测试 |
 | 登录失败 "Invalid credentials" | 密码错误或 bind_id 不对 | 确认 Manager DN 和密码 |
 | 登录后无法搜索 | 匿名搜索被 ACL 禁止 | config.php 中设置 `login','bind_id'` 或 `anon_bind` |

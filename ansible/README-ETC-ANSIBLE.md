@@ -1,6 +1,6 @@
 # /etc/ansible — Ansible Management
 
-> Ansible `core 2.13.13` | 主机: `mgmt01.example.com` (192.168.1.14)
+> Ansible `core 2.13.13` | 主机: `mgmt01.example.com` (192.0.2.14)
 
 ## 目录结构
 

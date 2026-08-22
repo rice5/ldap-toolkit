@@ -1,5 +1,10 @@
-# Force LF line endings for scripts (avoids CRLF shebang issues on Linux)
+# Force LF line endings (avoids CRLF issues on Linux / cross-platform editing)
 *.py text eol=lf
 *.sh text eol=lf
 *.php text eol=lf
 *.conf text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.example text eol=lf
+*.env text eol=lf

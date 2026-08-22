@@ -65,7 +65,7 @@ if [ -f "${SCRIPT_DIR}/files/ca.crt" ]; then
     echo "  [OK] files/ca.crt"
 else
     echo "  [警告] files/ca.crt 不存在，请从 ldap01 获取:"
-    echo "    scp root@192.168.1.12:/etc/openldap/certs/ca.crt ${ANSIBLE_DIR}/files/"
+    echo "    scp root@192.0.2.12:/etc/openldap/certs/ca.crt ${ANSIBLE_DIR}/files/"
 fi
 
 #------------------------------------------------------------------------------
