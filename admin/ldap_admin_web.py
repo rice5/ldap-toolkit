@@ -74,6 +74,8 @@ class Config(object):
 
         self.ldap_user_base = "ou=People,dc=example,dc=com"
         self.ldap_group_base = "ou=Group,dc=example,dc=com"
+        self.ldap_sudo_base = "ou=sudoers,dc=example,dc=com"
+        self.ldap_automount_base = "nisMapName=auto.nfs,ou=automapper,dc=example,dc=com"
 
         self.default_shell = "/bin/csh"
         self.default_home_base = "/share/home"
@@ -130,6 +132,7 @@ class Config(object):
             "LDAP_MANAGER_PW": "ldap_manager_pw", "LDAP_TLS_CACERT": "ldap_tls_cacert",
             "LDAP_MANAGER_PW_FILE": "ldap_manager_pw_file",
             "LDAP_USER_BASE": "ldap_user_base", "LDAP_GROUP_BASE": "ldap_group_base",
+            "LDAP_SUDO_BASE": "ldap_sudo_base", "LDAP_AUTOMOUNT_BASE": "ldap_automount_base",
             "DEFAULT_SHELL": "default_shell", "DEFAULT_HOME_BASE": "default_home_base",
             "MAIL_DOMAIN": "mail_domain", "UID_MIN": "uid_min",
             "SHADOW_MAX_DAYS": "shadow_max_days", "SHADOW_WARN_DAYS": "shadow_warn_days",
@@ -305,10 +308,11 @@ class LDAPClient(object):
                 cur_dn = line[3:].strip()
                 continue
             if ":" in line:
-                key, sep, val = line.partition(":")
+                key, _, val = line.partition(":")
                 key = key.strip()
                 val = val.strip()
-                if sep == "::":  # base64
+                if val.startswith(":"):  # base64 编码 (key:: value)
+                    val = val[1:].strip()
                     try:
                         val = base64.b64decode(val).decode("utf-8", "replace")
                     except Exception:
@@ -792,6 +796,163 @@ class BusinessLogic(object):
                 raise LDAPError("成员 '{}' 操作失败: {}".format(m, e))
         return True
 
+    # ---- 批量操作 ----
+    def batch_add_users(self, lines):
+        """批量创建用户。每行 CSV: uid,group[,shell[,password[,home[,groups]]]]。
+        返回 [{"line": N, "uid": ..., "ok": bool, "message": ...}]"""
+        results = []
+        for idx, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 1 or not parts[0]:
+                results.append({"line": idx, "uid": "", "ok": False, "message": "空行或缺少用户名"})
+                continue
+            uid = parts[0]
+            data = {"uid": uid}
+            field_map = {1: "group", 2: "shell", 3: "password", 4: "home", 5: "groups"}
+            for i, key in field_map.items():
+                if len(parts) > i and parts[i]:
+                    data[key] = parts[i]
+            try:
+                r = self.create_user(data)
+                msg = "创建成功 UID {}".format(r.get("uidNumber", ""))
+                if r.get("generated_password"):
+                    msg += "，初始密码 {}".format(r["generated_password"])
+                results.append({"line": idx, "uid": uid, "ok": True, "message": msg})
+            except Exception as e:
+                results.append({"line": idx, "uid": uid, "ok": False, "message": str(e)})
+        return results
+
+    def batch_delete_users(self, uids):
+        """批量删除用户。返回 [{"uid": ..., "ok": bool, "message": ...}]"""
+        results = []
+        for uid in uids:
+            uid = uid.strip()
+            if not uid or uid.startswith("#"):
+                continue
+            try:
+                self.delete_user(uid, remove_groups=True)
+                results.append({"uid": uid, "ok": True, "message": "已删除"})
+            except Exception as e:
+                results.append({"uid": uid, "ok": False, "message": str(e)})
+        return results
+
+    # ---- automount ----
+    def list_automount(self):
+        attrs = ["cn", "nisMapName", "nisMapEntry"]
+        items = []
+        for dn, a in self.ldap.search(self.cfg.ldap_automount_base, "(objectClass=nisObject)", attrs):
+            items.append({
+                "dn": dn,
+                "cn": a.get("cn", [""])[0],
+                "nisMapName": a.get("nisMapName", [""])[0],
+                "nisMapEntry": a.get("nisMapEntry", [""])[0] if a.get("nisMapEntry") else "",
+            })
+        items.sort(key=lambda x: x["cn"])
+        return items
+
+    def add_automount(self, mount_path, target, opts="vers=3,rw"):
+        if not mount_path.startswith("/"):
+            raise LDAPError("挂载路径必须以 / 开头")
+        dn = "cn={},{}".format(mount_path, self.cfg.ldap_automount_base)
+        nis_map_entry = "-fstype=nfs,{} {}".format(opts, target)
+        self.ldap.add(dn, [
+            ("objectClass", ["top", "nisObject"]),
+            ("cn", [mount_path]),
+            ("nisMapEntry", [nis_map_entry]),
+            ("nisMapName", ["auto.nfs"]),
+        ])
+        return {"mount_path": mount_path, "nisMapEntry": nis_map_entry}
+
+    def delete_automount(self, mount_path):
+        dn = "cn={},{}".format(mount_path, self.cfg.ldap_automount_base)
+        if self.ldap.search_one(self.cfg.ldap_automount_base, "(cn={})".format(ldap_filter_escape(mount_path)), ["dn"]) is None:
+            raise LDAPError("挂载条目 '{}' 未找到".format(mount_path))
+        self.ldap.delete(dn)
+        return True
+
+    # ---- sudo 策略 ----
+    def list_sudo_rules(self):
+        attrs = ["cn", "sudoUser", "sudoHost", "sudoCommand", "sudoOption",
+                 "sudoRunAsUser", "sudoRunAsGroup", "sudoOrder", "description"]
+        items = []
+        for dn, a in self.ldap.search(self.cfg.ldap_sudo_base, "(objectClass=sudoRole)", attrs):
+            items.append(self._sudo_to_dict(dn, a))
+        items.sort(key=lambda x: x["cn"])
+        return items
+
+    def _sudo_to_dict(self, dn, a):
+        def multi(k):
+            return a.get(k, [])
+        def one(k):
+            v = a.get(k, [""])
+            return v[0] if v else ""
+        return {
+            "dn": dn,
+            "cn": one("cn"),
+            "sudoUser": multi("sudoUser"),
+            "sudoHost": multi("sudoHost"),
+            "sudoCommand": multi("sudoCommand"),
+            "sudoOption": multi("sudoOption"),
+            "sudoRunAsUser": multi("sudoRunAsUser"),
+            "sudoRunAsGroup": multi("sudoRunAsGroup"),
+            "sudoOrder": one("sudoOrder"),
+            "description": one("description"),
+        }
+
+    def get_sudo_rule(self, name):
+        r = self.ldap.search_one(self.cfg.ldap_sudo_base, "(cn={})".format(ldap_filter_escape(name)),
+                                 ["cn", "sudoUser", "sudoHost", "sudoCommand", "sudoOption",
+                                  "sudoRunAsUser", "sudoRunAsGroup", "sudoOrder", "description"])
+        if not r:
+            return None
+        return self._sudo_to_dict(r[0], r[1])
+
+    def create_sudo_rule(self, data):
+        name = (data.get("name") or "").strip()
+        if not name:
+            raise LDAPError("规则名不能为空")
+        if self.get_sudo_rule(name):
+            raise LDAPError("sudo 规则 '{}' 已存在".format(name))
+        sudo_user = [x.strip() for x in (data.get("sudoUser") or "").split(",") if x.strip()]
+        sudo_host = [x.strip() for x in (data.get("sudoHost") or "ALL").split(",") if x.strip()]
+        sudo_cmd = [x.strip() for x in (data.get("sudoCommand") or "ALL").split(",") if x.strip()]
+        sudo_opt = [x.strip() for x in (data.get("sudoOption") or "").split(",") if x.strip()]
+        runas_user = [x.strip() for x in (data.get("sudoRunAsUser") or "").split(",") if x.strip()]
+        runas_group = [x.strip() for x in (data.get("sudoRunAsGroup") or "").split(",") if x.strip()]
+        order = (data.get("sudoOrder") or "").strip()
+        desc = (data.get("description") or "").strip()
+
+        if not sudo_user:
+            raise LDAPError("sudoUser 不能为空（用户名或 %组名）")
+        if not sudo_cmd:
+            raise LDAPError("sudoCommand 不能为空")
+
+        attrs = [("objectClass", ["top", "sudoRole"]), ("cn", [name])]
+        attrs.append(("sudoUser", sudo_user))
+        attrs.append(("sudoHost", sudo_host))
+        attrs.append(("sudoCommand", sudo_cmd))
+        if sudo_opt:
+            attrs.append(("sudoOption", sudo_opt))
+        if runas_user:
+            attrs.append(("sudoRunAsUser", runas_user))
+        if runas_group:
+            attrs.append(("sudoRunAsGroup", runas_group))
+        if order:
+            attrs.append(("sudoOrder", [order]))
+        if desc:
+            attrs.append(("description", [desc]))
+        self.ldap.add("cn={},{}".format(name, self.cfg.ldap_sudo_base), attrs)
+        return {"name": name}
+
+    def delete_sudo_rule(self, name):
+        if not self.get_sudo_rule(name):
+            raise LDAPError("sudo 规则 '{}' 未找到".format(name))
+        self.ldap.delete("cn={},{}".format(name, self.cfg.ldap_sudo_base))
+        return True
+
 
 #===============================================================================
 # HTTP 服务
@@ -883,6 +1044,13 @@ class AdminWebHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/groups/"):
                 name = path[len("/api/groups/"):]
                 return self._api_get_group(name)
+            if path == "/api/automount":
+                return self._api_list_automount()
+            if path == "/api/sudo":
+                return self._api_list_sudo_rules()
+            if path.startswith("/api/sudo/"):
+                name = path[len("/api/sudo/"):]
+                return self._api_get_sudo_rule(name)
             return self._send_json({"error": "未知接口"}, 404)
         except LDAPError as e:
             return self._send_json({"error": str(e)}, 400)
@@ -914,6 +1082,16 @@ class AdminWebHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/groups/") and path.endswith("/members"):
                 name = path[len("/api/groups/"):-len("/members")]
                 return self._api_modify_members(name, body)
+            if path == "/api/batch/users":
+                return self._api_batch_add_users(body)
+            if path == "/api/batch/users/delete":
+                return self._api_batch_delete_users(body)
+            if path == "/api/automount":
+                return self._api_add_automount(body)
+            if path == "/api/automount/delete":
+                return self._api_delete_automount(body)
+            if path == "/api/sudo":
+                return self._api_create_sudo_rule(body)
             return self._send_json({"error": "未知接口"}, 404)
         except LDAPError as e:
             return self._send_json({"error": str(e)}, 400)
@@ -948,6 +1126,9 @@ class AdminWebHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/groups/"):
                 name = path[len("/api/groups/"):]
                 return self._api_delete_group(name)
+            if path.startswith("/api/sudo/"):
+                name = path[len("/api/sudo/"):]
+                return self._api_delete_sudo_rule(name)
             return self._send_json({"error": "未知接口"}, 404)
         except LDAPError as e:
             return self._send_json({"error": str(e)}, 400)
@@ -1048,6 +1229,55 @@ class AdminWebHandler(BaseHTTPRequestHandler):
 
     def _api_modify_members(self, name, body):
         self.logic.modify_group_members(name, body.get("action", ""), body.get("members", []))
+        return self._send_json({"ok": True})
+
+    # ---- 批量 API ----
+    def _api_batch_add_users(self, body):
+        lines = body.get("lines", [])
+        if isinstance(lines, str):
+            lines = lines.splitlines()
+        results = self.logic.batch_add_users(lines)
+        return self._send_json({"results": results})
+
+    def _api_batch_delete_users(self, body):
+        uids = body.get("uids", [])
+        if isinstance(uids, str):
+            uids = uids.splitlines()
+        results = self.logic.batch_delete_users(uids)
+        return self._send_json({"results": results})
+
+    # ---- automount API ----
+    def _api_list_automount(self):
+        items = self.logic.list_automount()
+        return self._send_json({"items": items, "total": len(items)})
+
+    def _api_add_automount(self, body):
+        r = self.logic.add_automount(body.get("mount_path", ""),
+                                     body.get("target", ""),
+                                     body.get("opts", "vers=3,rw"))
+        return self._send_json({"ok": True, **r})
+
+    def _api_delete_automount(self, body):
+        self.logic.delete_automount(body.get("mount_path", ""))
+        return self._send_json({"ok": True})
+
+    # ---- sudo API ----
+    def _api_list_sudo_rules(self):
+        items = self.logic.list_sudo_rules()
+        return self._send_json({"items": items, "total": len(items)})
+
+    def _api_get_sudo_rule(self, name):
+        d = self.logic.get_sudo_rule(name)
+        if not d:
+            return self._send_json({"error": "sudo 规则未找到"}, 404)
+        return self._send_json(d)
+
+    def _api_create_sudo_rule(self, body):
+        r = self.logic.create_sudo_rule(body)
+        return self._send_json({"ok": True, **r})
+
+    def _api_delete_sudo_rule(self, name):
+        self.logic.delete_sudo_rule(name)
         return self._send_json({"ok": True})
 
     def log_message(self, fmt, *args):

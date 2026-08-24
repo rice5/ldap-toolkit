@@ -197,6 +197,9 @@ tbody tr:last-child td { border-bottom: none; }
     <div class="tabs">
       <button class="tab active" data-tab="users">用户</button>
       <button class="tab" data-tab="groups">组</button>
+      <button class="tab" data-tab="batch">批量</button>
+      <button class="tab" data-tab="automount">挂载</button>
+      <button class="tab" data-tab="sudo">Sudo</button>
     </div>
     <div class="spacer"></div>
     <input class="search" id="globalSearch" placeholder="搜索用户 / 组…">
@@ -240,6 +243,62 @@ tbody tr:last-child td { border-bottom: none; }
           <tbody id="groupTbody"></tbody>
         </table>
         <div class="empty" id="groupEmpty" style="display:none;">无匹配组</div>
+      </div>
+    </div>
+
+    <!-- 批量面板 -->
+    <div id="batchPanel" style="display:none;">
+      <div class="toolbar">
+        <span class="user-chip">批量操作：CSV 格式每行一个用户 <code>uid,group[,shell[,password[,home[,groups]]]]</code>，删除时每行一个 uid</span>
+      </div>
+      <div class="table-wrap" style="padding:16px">
+        <div class="field" style="margin-bottom:12px">
+          <label>批量创建用户（CSV，每行一个）</label>
+          <textarea id="batchAddText" rows="8" placeholder="zhangsan,devteam&#10;lisi,devteam,/bin/bash&#10;wangwu,ops,,Passw0rd!123"></textarea>
+        </div>
+        <button class="btn btn-primary" id="batchAddBtn">批量创建</button>
+        <div class="field" style="margin-top:20px;margin-bottom:12px">
+          <label>批量删除用户（每行一个 uid）</label>
+          <textarea id="batchDelText" rows="6" placeholder="zhangsan&#10;lisi"></textarea>
+        </div>
+        <button class="btn btn-danger" id="batchDelBtn">批量删除</button>
+        <div id="batchResult" style="margin-top:16px"></div>
+      </div>
+    </div>
+
+    <!-- 挂载面板 -->
+    <div id="automountPanel" style="display:none;">
+      <div class="toolbar">
+        <button class="btn btn-primary" id="addMountBtn">+ 添加挂载</button>
+        <div class="spacer"></div>
+        <span class="user-chip" id="mountCount"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>挂载路径</th><th>NFS 目标/选项</th><th style="text-align:right">操作</th>
+          </tr></thead>
+          <tbody id="mountTbody"></tbody>
+        </table>
+        <div class="empty" id="mountEmpty" style="display:none;">无挂载条目</div>
+      </div>
+    </div>
+
+    <!-- Sudo 面板 -->
+    <div id="sudoPanel" style="display:none;">
+      <div class="toolbar">
+        <button class="btn btn-primary" id="addSudoBtn">+ 添加规则</button>
+        <div class="spacer"></div>
+        <span class="user-chip" id="sudoCount"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>规则名</th><th>用户</th><th>主机</th><th>命令</th><th>选项</th><th style="text-align:right">操作</th>
+          </tr></thead>
+          <tbody id="sudoTbody"></tbody>
+        </table>
+        <div class="empty" id="sudoEmpty" style="display:none;">无 sudo 规则</div>
       </div>
     </div>
   </div>
@@ -349,14 +408,18 @@ function showApp(username) {
 }
 
 // ---------- 标签页 ----------
+const PANELS = { users: "usersPanel", groups: "groupsPanel", batch: "batchPanel", automount: "automountPanel", sudo: "sudoPanel" };
+const TAB_LOADERS = { users: loadUsers, groups: loadGroups, batch: null, automount: loadAutomount, sudo: loadSudo };
 document.querySelectorAll(".tab").forEach(tab => {
   tab.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
     tab.classList.add("active");
     CURRENT_TAB = tab.dataset.tab;
-    $("usersPanel").style.display = CURRENT_TAB === "users" ? "block" : "none";
-    $("groupsPanel").style.display = CURRENT_TAB === "groups" ? "block" : "none";
-    if (CURRENT_TAB === "users") loadUsers(); else loadGroups();
+    Object.entries(PANELS).forEach(([k, id]) => {
+      $(id).style.display = (k === CURRENT_TAB) ? "block" : "none";
+    });
+    const loader = TAB_LOADERS[CURRENT_TAB];
+    if (loader) loader();
   });
 });
 
@@ -402,7 +465,8 @@ async function loadUsers() {
   } catch (e) { toast(e.message, "error"); }
 }
 $("globalSearch").addEventListener("input", () => {
-  if (CURRENT_TAB === "users") loadUsers(); else loadGroups();
+  if (CURRENT_TAB === "users") loadUsers();
+  else if (CURRENT_TAB === "groups") loadGroups();
 });
 
 window.showUser = async function(uid) {
@@ -614,6 +678,146 @@ window.deleteGroup = async function(name) {
   try {
     await api("DELETE", "/api/groups/" + encodeURIComponent(name));
     toast("已删除", "success"); loadGroups();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+// ---------- 批量 ----------
+$("batchAddBtn").addEventListener("click", async () => {
+  const lines = $("batchAddText").value.split("\n");
+  if (!lines.filter(l => l.trim()).length) { toast("请输入要创建的用户", "error"); return; }
+  try {
+    const r = await api("POST", "/api/batch/users", { lines });
+    renderBatchResult(r.results);
+  } catch (e) { toast(e.message, "error"); }
+});
+$("batchDelBtn").addEventListener("click", async () => {
+  const uids = $("batchDelText").value.split("\n");
+  if (!uids.filter(l => l.trim()).length) { toast("请输入要删除的用户", "error"); return; }
+  if (!confirm("确认批量删除 " + uids.filter(l => l.trim()).length + " 个用户？此操作不可撤销。")) return;
+  try {
+    const r = await api("POST", "/api/batch/users/delete", { uids });
+    renderBatchResult(r.results);
+  } catch (e) { toast(e.message, "error"); }
+});
+function renderBatchResult(results) {
+  const ok = results.filter(r => r.ok).length;
+  const fail = results.length - ok;
+  let html = '<div style="margin-bottom:8px"><b>完成：成功 ' + ok + '，失败 ' + fail + '</b></div>';
+  html += '<table><thead><tr><th>行</th><th>用户名</th><th>结果</th></tr></thead><tbody>';
+  results.forEach(r => {
+    html += '<tr><td>' + r.line + '</td><td class="mono">' + esc(r.uid) + '</td>' +
+      '<td style="color:' + (r.ok ? 'var(--success)' : 'var(--danger)') + '">' + esc(r.message) + '</td></tr>';
+  });
+  html += '</tbody></table>';
+  $("batchResult").innerHTML = html;
+  loadUsers();
+}
+
+// ---------- 挂载 ----------
+async function loadAutomount() {
+  try {
+    const data = await api("GET", "/api/automount");
+    $("mountCount").textContent = "共 " + data.total + " 条";
+    $("mountTbody").innerHTML = data.items.map(m =>
+      '<tr><td class="mono">' + esc(m.cn) + '</td><td class="mono">' + esc(m.nisMapEntry) + '</td>' +
+      '<td style="text-align:right"><button class="btn btn-sm btn-icon" title="删除" onclick="deleteMount(\'' + esc(m.cn) + '\')">🗑</button></td></tr>'
+    ).join("");
+    $("mountEmpty").style.display = data.items.length ? "none" : "block";
+  } catch (e) { toast(e.message, "error"); }
+}
+$("addMountBtn").addEventListener("click", () => {
+  openModal("添加挂载条目", `
+    <div class="form-grid">
+      <div class="field full"><label>挂载路径 *（以 / 开头）</label><input id="m_path" placeholder="/share/project/xxx"></div>
+      <div class="field full"><label>NFS 目标 *（如 nfs01.example.com:/xxx）</label><input id="m_target"></div>
+      <div class="field full"><label>挂载选项</label><input id="m_opts" value="vers=3,rw"></div>
+    </div>`,
+    '<button class="btn btn-primary" onclick="submitAddMount()">添加</button>' +
+    '<button class="btn" onclick="closeModal()">取消</button>');
+});
+window.submitAddMount = async function() {
+  try {
+    await api("POST", "/api/automount", {
+      mount_path: $("m_path").value.trim(), target: $("m_target").value.trim(),
+      opts: $("m_opts").value.trim() || "vers=3,rw",
+    });
+    toast("挂载条目已添加", "success"); closeModal(); loadAutomount();
+  } catch (e) { toast(e.message, "error"); }
+};
+window.deleteMount = async function(path) {
+  if (!confirm("确认删除挂载条目 " + path + "？")) return;
+  try {
+    await api("POST", "/api/automount/delete", { mount_path: path });
+    toast("已删除", "success"); loadAutomount();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+// ---------- Sudo ----------
+async function loadSudo() {
+  try {
+    const data = await api("GET", "/api/sudo");
+    $("sudoCount").textContent = "共 " + data.total + " 条";
+    $("sudoTbody").innerHTML = data.items.map(s => {
+      const opts = (s.sudoOption || []).join(", ");
+      return '<tr>' +
+        '<td class="mono"><a href="#" onclick="showSudoRule(\'' + esc(s.cn) + '\');return false;">' + esc(s.cn) + '</a></td>' +
+        '<td class="mono">' + esc((s.sudoUser || []).join(", ")) + '</td>' +
+        '<td class="mono">' + esc((s.sudoHost || []).join(", ")) + '</td>' +
+        '<td class="mono">' + esc((s.sudoCommand || []).join(", ")) + '</td>' +
+        '<td class="mono">' + esc(opts) + '</td>' +
+        '<td style="text-align:right"><button class="btn btn-sm btn-icon" title="删除" onclick="deleteSudoRule(\'' + esc(s.cn) + '\')">🗑</button></td></tr>';
+    }).join("");
+    $("sudoEmpty").style.display = data.items.length ? "none" : "block";
+  } catch (e) { toast(e.message, "error"); }
+}
+window.showSudoRule = async function(name) {
+  try {
+    const s = await api("GET", "/api/sudo/" + encodeURIComponent(name));
+    openModal("Sudo 规则: " + s.cn,
+      '<div class="detail-grid">' +
+        detailItem("DN", s.dn) +
+        detailItem("用户 (sudoUser)", (s.sudoUser || []).join(", ") || "-") +
+        detailItem("主机 (sudoHost)", (s.sudoHost || []).join(", ") || "-") +
+        detailItem("命令 (sudoCommand)", (s.sudoCommand || []).join(", ") || "-") +
+        detailItem("选项 (sudoOption)", (s.sudoOption || []).join(", ") || "-") +
+        detailItem("RunAs 用户", (s.sudoRunAsUser || []).join(", ") || "-") +
+        detailItem("RunAs 组", (s.sudoRunAsGroup || []).join(", ") || "-") +
+        detailItem("排序", s.sudoOrder || "-") +
+        detailItem("描述", s.description || "-") +
+      '</div>',
+      '<button class="btn" onclick="closeModal()">关闭</button>');
+  } catch (e) { toast(e.message, "error"); }
+};
+$("addSudoBtn").addEventListener("click", () => {
+  openModal("添加 Sudo 规则", `
+    <div class="form-grid">
+      <div class="field"><label>规则名 *</label><input id="s_name" placeholder="sudo_xxx"></div>
+      <div class="field"><label>排序</label><input id="s_order" type="number" placeholder="如 20"></div>
+      <div class="field full"><label>用户 (sudoUser) *，逗号分隔，组用 %组名</label><input id="s_user" placeholder="watson.xu 或 %devteam"></div>
+      <div class="field full"><label>主机 (sudoHost)，逗号分隔</label><input id="s_host" value="ALL"></div>
+      <div class="field full"><label>命令 (sudoCommand)，逗号分隔</label><input id="s_cmd" value="ALL"></div>
+      <div class="field full"><label>选项 (sudoOption)，逗号分隔</label><input id="s_opt" placeholder="如 !authenticate"></div>
+      <div class="field full"><label>描述</label><input id="s_desc"></div>
+    </div>`,
+    '<button class="btn btn-primary" onclick="submitAddSudo()">添加</button>' +
+    '<button class="btn" onclick="closeModal()">取消</button>');
+});
+window.submitAddSudo = async function() {
+  try {
+    await api("POST", "/api/sudo", {
+      name: $("s_name").value.trim(), sudoOrder: $("s_order").value.trim(),
+      sudoUser: $("s_user").value.trim(), sudoHost: $("s_host").value.trim(),
+      sudoCommand: $("s_cmd").value.trim(), sudoOption: $("s_opt").value.trim(),
+      description: $("s_desc").value.trim(),
+    });
+    toast("sudo 规则已添加", "success"); closeModal(); loadSudo();
+  } catch (e) { toast(e.message, "error"); }
+};
+window.deleteSudoRule = async function(name) {
+  if (!confirm("确认删除 sudo 规则 " + name + "？")) return;
+  try {
+    await api("DELETE", "/api/sudo/" + encodeURIComponent(name));
+    toast("已删除", "success"); loadSudo();
   } catch (e) { toast(e.message, "error"); }
 };
 
