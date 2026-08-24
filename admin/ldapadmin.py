@@ -572,6 +572,7 @@ class UserManager:
             'lock': lambda: self._set_shadow_max(user_dn, 0),
             'unlock': lambda: self._set_shadow_max(user_dn, config.shadow_max_days),
             'pwd-expire': lambda: self._force_pwd_change(user_dn),
+            'pwd-sync': lambda: self._sync_pwd_change(user_dn, value),
             'shell': lambda: self._change_attr(user_dn, 'loginShell', value),
             'home': lambda: self._change_attr(user_dn, 'homeDirectory', value),
             'status': lambda: self._show_status(username),
@@ -600,6 +601,7 @@ class UserManager:
             'lock':       ('锁定密码', f'shadowMax=0 (当前={current_max})'),
             'unlock':     ('解锁密码', f'shadowMax={config.shadow_max_days} (当前={current_max})'),
             'pwd-expire': ('强制改密', 'shadowLastChange=0'),
+            'pwd-sync':   ('同步改密日期', f'shadowLastChange={value or "今天"}（修复 phpldapadmin/SSH passwd 改密未回写）'),
             'shell':      ('修改 Shell', f'loginShell={value} (当前={current_shell})'),
             'home':       ('修改家目录', f'homeDirectory={value}'),
             'status':     ('查看状态', '(只读，不修改)'),
@@ -662,6 +664,32 @@ class UserManager:
             (ldap.MOD_REPLACE, 'shadowMax', str(config.shadow_max_days).encode()),
         ])
         print("用户下次登录时必须修改密码。")
+        return 0
+
+    def _sync_pwd_change(self, dn, date_str=None):
+        """同步 shadowLastChange 到指定日期（默认今天）。
+
+        用于修复 phpldapadmin / SSH passwd 改密不回写 shadowLastChange 的问题：
+        这两条路径只改 userPassword，导致「上次改密/密码过期日」停留在旧值。
+
+        时区说明：shadowLastChange 是「UTC 天数」（epoch 秒 // 86400）。
+        指定历史日期时按该日期的 UTC 午夜换算，确保在 +08:00 时区显示正确
+        （若用 naive datetime 的 timestamp() 会因本地时区偏移少算 1 天）。
+        """
+        from datetime import timezone as _tz
+        if date_str:
+            try:
+                dt = datetime.strptime(date_str, '%Y-%m-%d')
+                days = int(dt.replace(tzinfo=_tz.utc).timestamp() / 86400)
+            except ValueError:
+                print(f"错误: 无效的日期格式 '{date_str}'，请使用 YYYY-MM-DD。", file=sys.stderr)
+                return 1
+        else:
+            days = int(datetime.now().timestamp() / 86400)
+        disp = datetime.fromtimestamp(days * 86400).strftime('%Y-%m-%d')
+        self.conn.modify(dn, [(ldap.MOD_REPLACE, 'shadowLastChange', str(days).encode())])
+        print(f"shadowLastChange 已同步为 {days}（显示日期 {disp}）。")
+        logging.info(f"shadowLastChange synced: {dn} -> {days} ({disp})")
         return 0
 
     def _change_attr(self, dn, attr, value):
@@ -1129,8 +1157,8 @@ def build_parser():
     # ── user mod ──
     ua_mod = ua.add_parser('mod', help='修改用户')
     ua_mod.add_argument('username', help='用户名')
-    ua_mod.add_argument('action', choices=['enable', 'disable', 'expire', 'expire-date', 'max-days', 'lock', 'unlock', 'pwd-expire', 'shell', 'home', 'status'],
-                        help='操作: enable/disable/expire/lock/unlock/pwd-expire/shell/home/status')
+    ua_mod.add_argument('action', choices=['enable', 'disable', 'expire', 'expire-date', 'max-days', 'lock', 'unlock', 'pwd-expire', 'pwd-sync', 'shell', 'home', 'status'],
+                        help='操作: enable/disable/expire/lock/unlock/pwd-expire/pwd-sync/shell/home/status')
     ua_mod.add_argument('value', nargs='?', help='操作参数（如 shell 路径、家目录、过期日期 YYYY-MM-DD）')
     ua_mod.add_argument('--dry-run', '-n', action='store_true', help='预演模式：仅显示将要修改的信息，不实际写入 LDAP')
 

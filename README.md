@@ -169,9 +169,23 @@ cd admin
 | `lock` | Lock password | `shadowMax = 0` |
 | `unlock` | Unlock password | `shadowMax = 90` |
 | `pwd-expire` | Force password change | `shadowLastChange = 0` |
+| `pwd-sync YYYY-MM-DD` | Sync password-change date | Fixes phpldapadmin/SSH passwd not writing shadowLastChange; omit date for today |
 | `expire YYYY-MM-DD` | Set expiry date | `shadowExpire = date` |
 | `shell <path>` | Change shell | e.g. `/bin/csh` |
 | `home <path>` | Change home directory | e.g. `/data/home/<uid>` |
+
+#### Password-change paths vs shadowLastChange (important)
+
+`shadowLastChange` (last password-change date) drives expiry calc (`expiry = shadowLastChange + shadowMax`), but it is NOT auto-updated on every password change:
+
+| Path | Updates shadowLastChange | Notes |
+|------|:---:|------|
+| `ldapadmin.py user passwd` | ✅ | Explicitly rewrites it after change |
+| Self-service site (SELF_SERVICE_URL) | ✅ | change.php calls update_shadow_lastchange() |
+| phpldapadmin | ❌ | Only changes userPassword |
+| SSH `passwd` (SSSD/nslcd) | ❌ | LDAP EXOP changes userPassword only; OpenLDAP ppolicy tracks pwdChangedTime (a separate attr), unrelated to shadowLastChange |
+
+After changing a password via phpldapadmin or SSH passwd, run `user mod <uid> pwd-sync YYYY-MM-DD` to sync, otherwise the displayed last-change/expiry date stays stale.
 
 #### user passwd — Change Password
 

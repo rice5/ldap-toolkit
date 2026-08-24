@@ -151,9 +151,23 @@ cd admin
 | `lock` | 锁定密码 | `shadowMax = 0` |
 | `unlock` | 解锁密码 | `shadowMax = 90` |
 | `pwd-expire` | 强制下次改密 | `shadowLastChange = 0` |
+| `pwd-sync YYYY-MM-DD` | 同步改密日期 | 修复 phpldapadmin/SSH passwd 改密不回写 shadowLastChange 的问题；不带日期则设为今天 |
 | `expire YYYY-MM-DD` | 设置过期日期 | `shadowExpire = 日期` |
 | `shell <path>` | 修改 Shell | 如 `/bin/csh` |
 | `home <path>` | 修改家目录 | 如 `/data/home/<uid>` |
+
+#### 改密路径与 shadowLastChange（重要）
+
+`shadowLastChange`（上次改密日期）是密码过期计算的依据（`密码过期日 = shadowLastChange + shadowMax`），但它不会随密码修改自动更新。各改密路径行为：
+
+| 改密路径 | 更新 shadowLastChange | 说明 |
+|---------|:---:|------|
+| `ldapadmin.py user passwd` | ✅ | 改密后显式回写 |
+| 自助网站（SELF_SERVICE_URL） | ✅ | change.php 改密后调用 update_shadow_lastchange() |
+| phpldapadmin | ❌ | 只改 userPassword，不回写 shadowLastChange |
+| SSH 后 `passwd`（SSSD/nslcd） | ❌ | 走 LDAP EXOP 只改 userPassword，OpenLDAP ppolicy 维护的是 pwdChangedTime（另一套属性），与 shadowLastChange 无关 |
+
+用 phpldapadmin 或 SSH passwd 改密后，需用 `user mod <uid> pwd-sync YYYY-MM-DD` 手动同步，否则「上次改密/密码过期日」会停留在旧值。
 
 #### user passwd — 改密码
 
