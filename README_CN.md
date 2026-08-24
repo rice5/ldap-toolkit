@@ -343,8 +343,11 @@ D:/workspace/ldap/
 │   └── ldapquery.sh             # 客户端查询工具（普通用户可用）
 ├── admin/
 │   ├── ldapadmin.py            # 统一管理工具: user/group/batch/automount
+│   ├── ldap_admin_web.py       # 管理员 Web 管理站点后端（user/group CRUD）
+│   ├── web/                    # Web 站点前端单页应用（index.html）
 │   ├── password_expiry_notify.py  # 密码过期统计与通知（每天9点自动）
-│   └── password_expiry_cron.sh    # 定时任务入口（静默执行，出错告警）
+│   ├── password_expiry_cron.sh    # 定时任务入口（静默执行，出错告警）
+│   └── pwd_change_audit_sync.py   # 密码修改审计对齐（auditlog）
 ├── batch/
 │   ├── addjaguar.sh            # 批量用户导入
 │   └── deljaguar.sh            # 批量用户删除
@@ -359,6 +362,30 @@ D:/workspace/ldap/
 └── docs/
     └── TLS-SETUP.md            # TLS 部署指南
 ```
+
+## Web 管理站点（管理员）
+
+面向管理员的图形化 Web 管理站点，管理用户 / 组（重点）、批量操作、automount、sudo 策略。
+功能参考 `ldapadmin.py`，提供 Web 界面，避免直接敲命令行。
+
+- **后端**：`admin/ldap_admin_web.py`（Python3 标准库 `http.server` + 系统 ldapsearch/ldapmodify，零第三方依赖）
+- **前端**：`admin/web/index.html`（单页应用，slim 顶栏 + 深/浅主题切换 + 搜索）
+- **部署**：详见 `docs/ADMIN-WEB-DEPLOY.md`
+
+```bash
+# 启动（读取 config/ldap_admin_web.env）
+python3 admin/ldap_admin_web.py
+# 浏览器访问 http://127.0.0.1:8080/，用 env 里配置的管理员账号登录
+```
+
+**功能（Phase 1）**：
+
+| 模块 | 功能 |
+|------|------|
+| 用户管理 | 列表（搜索/OU 过滤）、创建、编辑、启用/禁用、锁定/解锁、强制改密、同步改密日期、重置密码、删除、详情 |
+| 组管理 | 列表、创建、删除、详情、成员管理（添加/移除） |
+
+**安全设计**：独立管理员账号（与 LDAP 分离）、Manager 密码仅存服务端、LDAP 过滤器转义防注入、密码强度校验。
 
 ## 安全
 
