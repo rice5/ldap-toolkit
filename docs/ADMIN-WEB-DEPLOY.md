@@ -52,6 +52,8 @@ LDAP_MANAGER_PW=<Manager密码>
 LDAP_TLS_CACERT=/etc/openldap/certs/ca.crt
 LDAP_USER_BASE=ou=People,dc=example,dc=com
 LDAP_GROUP_BASE=ou=Group,dc=example,dc=com
+LDAP_SUDO_BASE=ou=sudoers,dc=example,dc=com
+LDAP_AUTOMOUNT_BASE=nisMapName=auto.nfs,ou=automapper,dc=example,dc=com
 DEFAULT_SHELL=/bin/csh
 DEFAULT_HOME_BASE=/share/home
 MAIL_DOMAIN=example.com
@@ -89,9 +91,31 @@ systemctl enable --now ldap-admin-web
 systemctl status ldap-admin-web
 ```
 
-### 4. Nginx 反向代理（统一入口 + TLS）
+### 4. 反向代理（统一入口 + TLS）
+
+> **生产拓扑**：ldap01 / ldap02 只装了 httpd（httpd24 + rh-php70 SCL），**没有 nginx**。
+> 对外访问统一经 **yum01 服务器的 1Panel** 反代（与 self-service 门户相同方式），
+> 做负载均衡/入口收敛。本节给出两种方式，生产用 1Panel 即可。
+
+#### 方式 A：yum01 的 1Panel 反代（生产实际用法）
+
+在 yum01 的 1Panel「网站」里创建站点 `ldapadmin.example.com`，反向代理目标指向
+ldap01（和 ldap02，做负载均衡）的 `127.0.0.1:8080`：
+
+```
+# 1Panel 反代目标（upstream）
+ldap01:8080   (weight=1)
+ldap02:8080   (weight=1, 若两节点都部署了本服务)
+```
+
+1Panel 会自动生成 nginx 配置并配好 TLS 证书。等价的手写 nginx 配置如下：
 
 ```nginx
+upstream ldapadmin {
+    server ldap01.example.com:8080 weight=1 max_fails=2 fail_timeout=30s;
+    server ldap02.example.com:8080 weight=1 max_fails=2 fail_timeout=30s;
+}
+
 server {
     listen 443 ssl;
     server_name ldapadmin.example.com;
@@ -104,7 +128,7 @@ server {
     # deny all;
 
     location / {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://ldapadmin;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -112,7 +136,21 @@ server {
 }
 ```
 
-> 建议仅对管理网段开放（`allow`/`deny`），或在 nginx 层加一层 Basic Auth 双保险。
+> 管理站点务必限制访问来源（1Panel 里配 IP 白名单，或加一层 Basic Auth 双保险），
+> 因为它持有 LDAP Manager 写权限。
+
+#### 方式 B：ldap01 本机 httpd 反代（若需单机直连）
+
+ldap01 若需本机 httpd 反代（httpd24 已装，非 nginx），用 mod_proxy：
+
+```apache
+# /opt/rh/httpd24/root/etc/httpd/conf.d/ldapadmin.conf
+<VirtualHost *:80>
+    ServerName ldapadmin.example.com
+    ProxyPass / http://127.0.0.1:8080/
+    ProxyPassReverse / http://127.0.0.1:8080/
+</VirtualHost>
+```
 
 ### 5. 验证
 
@@ -128,12 +166,22 @@ curl -s -X POST http://127.0.0.1:8080/api/login \
 
 浏览器访问 `https://ldapadmin.example.com/`，用配置的管理员账号登录。
 
-## 功能清单（Phase 1）
+## 功能清单
+
+### Phase 1（user / group，重点）
 
 | 模块 | 功能 |
 |------|------|
 | 用户管理 | 列表（搜索/按 OU 过滤）、创建（自动分配 UID/GID、自动建主组/OU、密码强度校验）、编辑（shell/home/邮箱/电话）、启用/禁用、锁定/解锁、强制改密、同步改密日期、重置密码、删除（含清理空主组）、详情（含组成员/密码过期日） |
 | 组管理 | 列表（搜索）、创建、删除、详情、成员管理（添加/移除 memberUid） |
+
+### Phase 2（batch / automount / sudo）
+
+| 模块 | 功能 |
+|------|------|
+| 批量操作 | 批量创建用户（CSV: `uid,group[,shell[,password[,home[,groups]]]]`）、批量删除用户（每行一个 uid），逐行返回结果 |
+| Automount | NFS 挂载条目列表、添加、删除（nisObject，`nisMapName=auto.nfs`） |
+| Sudo 策略 | sudoRole 规则列表、详情、添加、删除（sudoUser/sudoHost/sudoCommand/sudoOption/sudoRunAsUser/sudoRunAsGroup/sudoOrder/description） |
 
 ## 安全设计
 
