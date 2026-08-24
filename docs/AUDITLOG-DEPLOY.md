@@ -91,5 +91,24 @@ olcAuditlogFile: /var/log/ldap/audit.log
 
 - `admin/pwd_change_audit_sync.py`：解析 audit.log，找「改过 userPassword 但
   shadowLastChange 未同步」的用户，`--dry-run` 报告 / `--apply` 自动对齐。
-- 建议用 hermes cron 每天跑一次（在密码过期通知之前，如 08:30），先 dry-run
-  观察数天，确认无误后再加 `--apply`。
+- 已部署到 ldap01 + ldap02 的 `/opt/ldap-toolkit/admin/pwd_change_audit_sync.py`。
+- 通过 hermes cron `ldap-pwd-audit-sync` 每天跑两次（08:00 + 16:00，no_agent）：
+  wrapper `~/.hermes/scripts/ldap-pwd-audit-sync.sh` SSH 到两节点各自执行。
+- **Python 3.6 兼容**（CentOS 7）：脚本的 subprocess 调用必须用
+  `stdout=PIPE, stderr=PIPE, universal_newlines=True`，不能用 `capture_output=True` / `text=True`（3.7+）。
+- Manager 凭据从本地密码文件（600 权限）读取，经环境变量 `LDAP_MANAGER_PW` 注入。
+
+## 运维查看审计日志
+
+```bash
+# 实时跟踪
+tail -f /var/log/ldap/audit.log
+# 查某用户的写操作
+grep -n "cn=<uid>" /var/log/ldap/audit.log
+# 只看密码修改（replace/add/delete userPassword）
+grep -E "^(replace|add|delete): userPassword" /var/log/ldap/audit.log
+# 轮转后的压缩文件
+zcat /var/log/ldap/audit.log-*.gz | grep userPassword
+```
+
+记录头 `# modify <unix秒> ...` 的时间戳可用 `date -d @<秒> +%F\ %T` 换算。

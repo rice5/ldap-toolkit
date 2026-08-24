@@ -91,19 +91,28 @@ def ts_to_epoch_days(ts):
 
 def ldap_query(dn_attr_map):
     """查多个 DN 的 shadowLastChange。返回 {dn: shadowLastChange_days 或 None}。"""
-    # 用 Manager 查询（只读账号可能没有所有 OU 的读权限）
+    # 用 Manager 查询（只读账号可能没有所有 OU 的读权限）；用 -y 密码文件避免 ps 泄露
     result = {}
-    cmd = [
-        "ldapsearch", "-x", "-LLL",
-        "-H", f"ldaps://{LDAP_HOST}:{LDAP_PORT}",
-        "-D", LDAP_MANAGER_DN,
-        "-w", LDAP_MANAGER_PW,
-        "-b", LDAP_SUFFIX,
-        "(objectClass=posixAccount)",
-        "dn", "uid", "shadowLastChange", "shadowMax",
-    ]
-    env = dict(os.environ, LDAPTLS_CACERT=LDAP_TLS_CACERT)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        f.write(LDAP_MANAGER_PW)
+        pw_path = f.name
+    os.chmod(pw_path, 0o600)
+    try:
+        cmd = [
+            "ldapsearch", "-x", "-LLL",
+            "-H", f"ldaps://{LDAP_HOST}:{LDAP_PORT}",
+            "-D", LDAP_MANAGER_DN,
+            "-y", pw_path,
+            "-b", LDAP_SUFFIX,
+            "(objectClass=posixAccount)",
+            "dn", "uid", "shadowLastChange", "shadowMax",
+        ]
+        env = dict(os.environ, LDAPTLS_CACERT=LDAP_TLS_CACERT)
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=60, env=env)
+    finally:
+        os.remove(pw_path)
     if r.returncode != 0:
         print("ldapsearch 失败:", r.stderr[:500], file=sys.stderr)
         return result
@@ -152,7 +161,8 @@ shadowLastChange: {days}
             "-f", ldif_path,
         ]
         env = dict(os.environ, LDAPTLS_CACERT=LDAP_TLS_CACERT)
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=30, env=env)
         return r.returncode == 0
     finally:
         os.remove(ldif_path)
@@ -190,6 +200,9 @@ def main():
             pwd_changes[dn] = days
 
     print(f"审计日志中改过密码的 DN: {len(pwd_changes)} 个")
+    if not pwd_changes:
+        print("无需对齐（审计日志中无 userPassword 修改记录）。")
+        return 0
 
     # 2) 查这些 DN 当前 shadowLastChange
     ldap_data = ldap_query(set(pwd_changes.keys()))
