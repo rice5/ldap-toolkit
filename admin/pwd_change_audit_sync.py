@@ -33,22 +33,25 @@ LDAP_MANAGER_DN = os.environ.get("LDAP_MANAGER_DN", f"cn=Manager,{LDAP_SUFFIX}")
 LDAP_MANAGER_PW = os.environ.get("LDAP_MANAGER_PW", "")   # 敏感，必须外部提供
 LDAP_TLS_CACERT = os.environ.get("LDAP_TLS_CACERT", "/etc/openldap/certs/ca.crt")
 
-# auditlog 记录里，userPassword 修改可能以这几种形式出现
-PWD_ATTR_RE = re.compile(r"^(\S+):\s*userPassword\s*$", re.IGNORECASE)
-# 时间戳注释行，如 "# 20260824110829Z"
-TS_RE = re.compile(r"^#\s*(\d{14}Z)\s*$")
+# auditlog 记录里，userPassword 修改以 modify 行的属性名出现（replace/add/delete: userPassword）
+PWD_ATTR_RE = re.compile(r"^(?:replace|add|delete):\s*userPassword\s*$", re.IGNORECASE)
+# 时间戳在记录头注释行："# modify <unix秒> <suffix> <binddn> IP=... conn=..."
+TS_RE = re.compile(r"^#\s*(?:modify|add|delete|modrdn)\s+(\d{10})\b")
 
 
 def iter_audit_records(glob_pattern):
-    """遍历审计日志（含轮转的 .gz 文件），产出 (timestamp_utc, dn, has_pwd_change)。
+    """遍历审计日志（含轮转的 .gz 文件），产出 (unix_ts, dn)。
 
-    记录格式（slapo-auditlog，OpenLDAP 2.4）示例：
-        # 20260824110829Z
+    记录格式（slapo-auditlog，OpenLDAP 2.4）实测示例：
+        # modify 1787572345 dc=example,dc=com cn=Manager,... IP=... conn=...
         dn: cn=harvey.zhu,ou=rd,ou=People,dc=...
         changetype: modify
         replace: userPassword
         userPassword:: e1NTSEF9...
         -
+        replace: entryCSN
+        ...
+        # end modify 1787572345
         <空行>
     """
     files = sorted(glob.glob(glob_pattern + "*"))
@@ -63,7 +66,7 @@ def iter_audit_records(glob_pattern):
                     line = line.rstrip("\n")
                     m = TS_RE.match(line.strip())
                     if m:
-                        cur_ts = m.group(1)
+                        cur_ts = int(m.group(1))
                         continue
                     if line.startswith("dn:"):
                         cur_dn = line[3:].strip()
@@ -82,9 +85,8 @@ def iter_audit_records(glob_pattern):
 
 
 def ts_to_epoch_days(ts):
-    """auditlog 时间戳（UTC, YYYYMMDDHHMMSSZ）→ shadowLastChange 语义的 UTC 天数。"""
-    dt = datetime.strptime(ts, "%Y%m%d%H%M%SZ").replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() / 86400)
+    """auditlog unix 秒时间戳 → shadowLastChange 语义的 UTC 天数。"""
+    return int(ts / 86400)
 
 
 def ldap_query(dn_attr_map):
