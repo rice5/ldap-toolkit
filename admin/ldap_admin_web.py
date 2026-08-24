@@ -69,6 +69,7 @@ class Config(object):
         self.ldap_suffix = "dc=example,dc=com"
         self.ldap_manager_dn = "cn=Manager,dc=example,dc=com"
         self.ldap_manager_pw = ""
+        self.ldap_manager_pw_file = ""   # 可选：从密码文件读取（优先于明文 LDAP_MANAGER_PW）
         self.ldap_tls_cacert = "/etc/openldap/certs/ca.crt"
 
         self.ldap_user_base = "ou=People,dc=example,dc=com"
@@ -90,8 +91,11 @@ class Config(object):
         if env_path:
             candidates.append(env_path)
         candidates.append(os.environ.get("LDAP_ADMIN_WEB_ENV", ""))
-        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       "..", "config", "ldap_admin_web.env"))
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # 脚本同目录（部署到 /opt/ldap-admin-web/ 时配置与脚本同目录）
+        candidates.append(os.path.join(script_dir, "ldap_admin_web.env"))
+        # 项目 config 目录（源码树开发时 config/ldap_admin_web.env）
+        candidates.append(os.path.join(script_dir, "..", "config", "ldap_admin_web.env"))
         for p in candidates:
             if p and os.path.isfile(p):
                 self._parse_env_file(p)
@@ -99,6 +103,11 @@ class Config(object):
 
         # 环境变量优先覆盖
         self._apply_env_overrides()
+
+        # 若配置了密码文件路径，优先从文件读取 Manager 密码（避免明文落盘两份）
+        if self.ldap_manager_pw_file and os.path.isfile(self.ldap_manager_pw_file):
+            with open(self.ldap_manager_pw_file) as f:
+                self.ldap_manager_pw = f.read().strip()
 
     def _parse_env_file(self, path):
         with open(path, "r") as f:
@@ -119,6 +128,7 @@ class Config(object):
             "LDAP_HOST": "ldap_host", "LDAP_PORT": "ldap_port",
             "LDAP_SUFFIX": "ldap_suffix", "LDAP_MANAGER_DN": "ldap_manager_dn",
             "LDAP_MANAGER_PW": "ldap_manager_pw", "LDAP_TLS_CACERT": "ldap_tls_cacert",
+            "LDAP_MANAGER_PW_FILE": "ldap_manager_pw_file",
             "LDAP_USER_BASE": "ldap_user_base", "LDAP_GROUP_BASE": "ldap_group_base",
             "DEFAULT_SHELL": "default_shell", "DEFAULT_HOME_BASE": "default_home_base",
             "MAIL_DOMAIN": "mail_domain", "UID_MIN": "uid_min",
