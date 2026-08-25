@@ -359,8 +359,6 @@ Production here is scheduled via hermes cron (no_agent mode, daily 09:00; the sc
 │   └── ldapquery.sh             # Client query tool (bash + ldapsearch)
 ├── admin/
 │   ├── ldapadmin.py             # Unified management CLI (user/group/batch/automount)
-│   ├── ldap_admin_web.py        # Admin web backend (user/group CRUD)
-│   ├── web/                     # Admin web frontend (index.html)
 │   ├── password_expiry_notify.py # Password expiry scan & notification (daily 09:00)
 │   ├── password_expiry_cron.sh   # Cron entry point (silent, alerts on failure)
 │   └── pwd_change_audit_sync.py  # Password-change audit sync (auditlog)
@@ -380,27 +378,19 @@ Production here is scheduled via hermes cron (no_agent mode, daily 09:00; the sc
 └── docs/
     ├── TLS-SETUP.md
     ├── SELFSERVICE-DEPLOY.md
-    ├── PHPLDAPADMIN-DEPLOY.md
-    └── ADMIN-WEB-DEPLOY.md
+    └── PHPLDAPADMIN-DEPLOY.md
 ```
 
 ## Admin Web Console
 
-A graphical web console for admins to manage users / groups (priority), batch operations,
-automount, and sudo policies — mirroring `ldapadmin.py` functionality without the CLI.
+A graphical web console for admins (users / groups / batch / automount / sudo). Split into its
+own repository:
 
-- **Backend**: `admin/ldap_admin_web.py` (Python3 stdlib `http.server` + system ldapsearch/ldapmodify, zero third-party deps)
-- **Frontend**: `admin/web/index.html` (SPA: slim top bar + dark/light theme + search)
-- **Deploy**: see `docs/ADMIN-WEB-DEPLOY.md`
+> **Repo**: `rice5/ldap-admin-web` (layout matches the production path `/opt/ldap-admin-web/`)
 
-```bash
-python3 admin/ldap_admin_web.py   # reads config/ldap_admin_web.env
-# browse http://127.0.0.1:8080/, sign in with the configured admin account
-```
-
-**Features (Phase 1)**: user CRUD (list/search/OU filter, create, edit, enable/disable,
-lock/unlock, force password change, pwd-sync, reset password, delete, detail) and group CRUD
-(list, create, delete, detail, member add/remove).
+- **Backend**: `ldap_admin_web.py` (Python3 stdlib `http.server` + system ldapsearch/ldapmodify, zero third-party deps)
+- **Frontend**: `web/index.html` (SPA: slim top bar + dark/light theme + search)
+- **Deploy**: see `docs/ADMIN-WEB-DEPLOY.md` in that repo
 
 **Security**: separate admin login (isolated from LDAP), Manager password server-side only,
 LDAP filter escaping against injection, password strength validation.
