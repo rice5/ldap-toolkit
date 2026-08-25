@@ -108,6 +108,11 @@ th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--bo
 th { background: var(--hover); font-weight: 600; font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .3px; }
 tbody tr:hover { background: var(--hover); }
 tbody tr:last-child td { border-bottom: none; }
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover { color: var(--primary); }
+th.sortable::after { content: " ↕"; opacity: .4; }
+th.sortable.asc::after { content: " ↑"; opacity: 1; color: var(--primary); }
+th.sortable.desc::after { content: " ↓"; opacity: 1; color: var(--primary); }
 .mono { font-family: "SF Mono", "Consolas", monospace; font-size: 12px; }
 .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
 .badge-green { background: rgba(22,163,74,.15); color: var(--success); }
@@ -220,7 +225,7 @@ tbody tr:last-child td { border-bottom: none; }
       <div class="table-wrap">
         <table>
           <thead><tr>
-            <th>用户名</th><th>OU</th><th>UID</th><th>邮箱</th><th>状态</th><th>密码过期</th><th style="text-align:right">操作</th>
+            <th data-sort="uid" class="sortable">用户名</th><th>OU</th><th>UID</th><th>邮箱</th><th data-sort="status" class="sortable">状态</th><th data-sort="pwdExpireDate" class="sortable">密码过期</th><th style="text-align:right">操作</th>
           </tr></thead>
           <tbody id="userTbody"></tbody>
         </table>
@@ -238,7 +243,7 @@ tbody tr:last-child td { border-bottom: none; }
       <div class="table-wrap">
         <table>
           <thead><tr>
-            <th>组名</th><th>GID</th><th>描述</th><th>成员数</th><th style="text-align:right">操作</th>
+            <th data-sort="cn" class="sortable">组名</th><th data-sort="gidNumber" class="sortable">GID</th><th>描述</th><th data-sort="memberCount" class="sortable">成员数</th><th style="text-align:right">操作</th>
           </tr></thead>
           <tbody id="groupTbody"></tbody>
         </table>
@@ -250,6 +255,10 @@ tbody tr:last-child td { border-bottom: none; }
     <div id="batchPanel" style="display:none;">
       <div class="toolbar">
         <span class="user-chip">批量操作：CSV 格式每行一个用户 <code>uid,group[,shell[,password[,home[,groups]]]]</code>，删除时每行一个 uid</span>
+        <div class="spacer"></div>
+        <button class="btn btn-sm" id="batchTplBtn">下载 CSV 模版</button>
+        <button class="btn btn-sm" id="batchImportBtn">导入 CSV 文件</button>
+        <input type="file" id="batchFileInput" accept=".csv,.txt" style="display:none">
       </div>
       <div class="table-wrap" style="padding:16px">
         <div class="field" style="margin-bottom:12px">
@@ -373,6 +382,16 @@ window.closeModal = closeModal;
 $("modalClose").addEventListener("click", closeModal);
 $("modal").addEventListener("click", (e) => { if (e.target === $("modal")) closeModal(); });
 
+// 醒目的删除/危险操作确认弹窗（替代原生 confirm）
+function confirmAction(title, message, onConfirm, confirmText) {
+  openModal(title,
+    '<div style="padding:4px 0"><p style="margin-bottom:12px;color:var(--text-secondary)">' + message + '</p>' +
+    '<p style="color:var(--warning);font-weight:600">此操作不可撤销，请确认。</p></div>',
+    '<button class="btn btn-danger" id="confirmYes">' + (confirmText || "确认删除") + '</button>' +
+    '<button class="btn" onclick="closeModal()">取消</button>');
+  $("confirmYes").addEventListener("click", () => { closeModal(); onConfirm(); });
+}
+
 // ---------- 认证 ----------
 async function doLogin() {
   try {
@@ -423,6 +442,42 @@ document.querySelectorAll(".tab").forEach(tab => {
   });
 });
 
+// ---------- 表头排序 ----------
+let userSort = { key: null, asc: true };
+let groupSort = { key: null, asc: true };
+function sortItems(items, sortState) {
+  if (!sortState.key) return items;
+  return items.slice().sort((a, b) => {
+    let va = a[sortState.key], vb = b[sortState.key];
+    if (sortState.key === "uidNumber" || sortState.key === "gidNumber" || sortState.key === "memberCount") {
+      va = parseInt(va) || 0; vb = parseInt(vb) || 0;
+    } else {
+      va = (va === undefined || va === null) ? "" : String(va);
+      vb = (vb === undefined || vb === null) ? "" : String(vb);
+    }
+    const cmp = va < vb ? -1 : (va > vb ? 1 : 0);
+    return sortState.asc ? cmp : -cmp;
+  });
+}
+function updateSortIndicators() {
+  document.querySelectorAll("th.sortable").forEach(th => {
+    th.classList.remove("asc", "desc");
+    const isUser = th.closest("#usersPanel") !== null;
+    const sortState = isUser ? userSort : groupSort;
+    if (sortState.key === th.dataset.sort) th.classList.add(sortState.asc ? "asc" : "desc");
+  });
+}
+document.querySelectorAll("th.sortable").forEach(th => {
+  th.addEventListener("click", () => {
+    const isUser = th.closest("#usersPanel") !== null;
+    const sortState = isUser ? userSort : groupSort;
+    if (sortState.key === th.dataset.sort) sortState.asc = !sortState.asc;
+    else { sortState.key = th.dataset.sort; sortState.asc = true; }
+    updateSortIndicators();
+    if (isUser) loadUsers(); else loadGroups();
+  });
+});
+
 // ---------- 用户 ----------
 async function loadOUs() {
   try {
@@ -440,9 +495,10 @@ async function loadUsers() {
     const ou = $("ouFilter").value;
     const qs = "?search=" + encodeURIComponent(search) + "&ou=" + encodeURIComponent(ou);
     const data = await api("GET", "/api/users" + qs);
+    const items = sortItems(data.items, userSort);
     $("userCount").textContent = "共 " + data.total + " 个用户";
     const tbody = $("userTbody");
-    tbody.innerHTML = data.items.map(u => {
+    tbody.innerHTML = items.map(u => {
       const statusBadge = u.status === "启用"
         ? '<span class="badge badge-green">启用</span>'
         : (u.status.startsWith("禁用") ? '<span class="badge badge-red">' + esc(u.status) + '</span>'
@@ -458,10 +514,11 @@ async function loadUsers() {
           '<button class="btn btn-sm btn-icon" title="详情" onclick="showUser(\'' + esc(u.uid) + '\')">👁</button> ' +
           '<button class="btn btn-sm btn-icon" title="编辑" onclick="editUser(\'' + esc(u.uid) + '\')">✎</button> ' +
           '<button class="btn btn-sm btn-icon" title="重置密码" onclick="resetPwd(\'' + esc(u.uid) + '\')">🔑</button> ' +
-          '<button class="btn btn-sm btn-icon" title="状态操作" onclick="userStatusMenu(\'' + esc(u.uid) + '\')">⚙</button>' +
+          '<button class="btn btn-sm btn-icon" title="状态操作" onclick="userStatusMenu(\'' + esc(u.uid) + '\')">⚙</button> ' +
+          '<button class="btn btn-sm btn-icon" title="删除" onclick="deleteUser(\'' + esc(u.uid) + '\')">🗑</button>' +
         '</td></tr>';
     }).join("");
-    $("userEmpty").style.display = data.items.length ? "none" : "block";
+    $("userEmpty").style.display = items.length ? "none" : "block";
   } catch (e) { toast(e.message, "error"); }
 }
 $("globalSearch").addEventListener("input", () => {
@@ -592,12 +649,13 @@ window.doStatus = async function(uid, action) {
   } catch (e) { toast(e.message, "error"); }
 };
 
-window.deleteUser = async function(uid) {
-  if (!confirm("确认删除用户 " + uid + "？此操作不可撤销，将同时从所有组移除。")) return;
-  try {
-    await api("DELETE", "/api/users/" + encodeURIComponent(uid));
-    toast("已删除", "success"); loadUsers();
-  } catch (e) { toast(e.message, "error"); }
+window.deleteUser = function(uid) {
+  confirmAction("删除用户", "确认删除用户 <b>" + esc(uid) + "</b>？将从所有组移除，并清理其空主组。", async () => {
+    try {
+      await api("DELETE", "/api/users/" + encodeURIComponent(uid));
+      toast("已删除", "success"); loadUsers();
+    } catch (e) { toast(e.message, "error"); }
+  });
 };
 
 // ---------- 组 ----------
@@ -606,9 +664,10 @@ async function loadGroups() {
     const search = $("globalSearch").value;
     const qs = "?search=" + encodeURIComponent(search);
     const data = await api("GET", "/api/groups" + qs);
+    const items = sortItems(data.items, groupSort);
     $("groupCount").textContent = "共 " + data.total + " 个组";
     const tbody = $("groupTbody");
-    tbody.innerHTML = data.items.map(g =>
+    tbody.innerHTML = items.map(g =>
       '<tr>' +
         '<td class="mono"><a href="#" onclick="showGroup(\'' + esc(g.cn) + '\');return false;">' + esc(g.cn) + '</a></td>' +
         '<td class="mono">' + esc(g.gidNumber) + '</td>' +
@@ -619,7 +678,7 @@ async function loadGroups() {
           '<button class="btn btn-sm btn-icon" title="删除" onclick="deleteGroup(\'' + esc(g.cn) + '\')">🗑</button>' +
         '</td></tr>'
     ).join("");
-    $("groupEmpty").style.display = data.items.length ? "none" : "block";
+    $("groupEmpty").style.display = items.length ? "none" : "block";
   } catch (e) { toast(e.message, "error"); }
 }
 
@@ -674,14 +733,40 @@ window.submitAddGroup = async function() {
   } catch (e) { toast(e.message, "error"); }
 };
 window.deleteGroup = async function(name) {
-  if (!confirm("确认删除组 " + name + "？")) return;
-  try {
-    await api("DELETE", "/api/groups/" + encodeURIComponent(name));
-    toast("已删除", "success"); loadGroups();
-  } catch (e) { toast(e.message, "error"); }
+  confirmAction("删除组", "确认删除组 <b>" + esc(name) + "</b>？该组的所有成员关系将一并移除。", async () => {
+    try {
+      await api("DELETE", "/api/groups/" + encodeURIComponent(name));
+      toast("已删除", "success"); loadGroups();
+    } catch (e) { toast(e.message, "error"); }
+  });
 };
 
 // ---------- 批量 ----------
+// CSV 模版下载（带 BOM，Excel 可直接打开）
+$("batchTplBtn").addEventListener("click", () => {
+  const tpl = "uid,group,shell,password,home,groups\n" +
+    "zhangsan,devteam,/bin/csh,,/share/home/zhangsan,devteam\n" +
+    "lisi,devteam,/bin/bash,Passw0rd!123,/share/home/lisi,\n";
+  const blob = new Blob(["\uFEFF" + tpl], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "ldap_users_template.csv";
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
+});
+// CSV 文件导入（读取到文本框，核对后点「批量创建」）
+$("batchImportBtn").addEventListener("click", () => $("batchFileInput").click());
+$("batchFileInput").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    $("batchAddText").value = reader.result;
+    toast("已导入 " + f.name + "，请核对后点「批量创建」", "success");
+  };
+  reader.readAsText(f);
+  e.target.value = "";
+});
 $("batchAddBtn").addEventListener("click", async () => {
   const lines = $("batchAddText").value.split("\n");
   if (!lines.filter(l => l.trim()).length) { toast("请输入要创建的用户", "error"); return; }
@@ -690,14 +775,16 @@ $("batchAddBtn").addEventListener("click", async () => {
     renderBatchResult(r.results);
   } catch (e) { toast(e.message, "error"); }
 });
-$("batchDelBtn").addEventListener("click", async () => {
+$("batchDelBtn").addEventListener("click", () => {
   const uids = $("batchDelText").value.split("\n");
-  if (!uids.filter(l => l.trim()).length) { toast("请输入要删除的用户", "error"); return; }
-  if (!confirm("确认批量删除 " + uids.filter(l => l.trim()).length + " 个用户？此操作不可撤销。")) return;
-  try {
-    const r = await api("POST", "/api/batch/users/delete", { uids });
-    renderBatchResult(r.results);
-  } catch (e) { toast(e.message, "error"); }
+  const valid = uids.filter(l => l.trim());
+  if (!valid.length) { toast("请输入要删除的用户", "error"); return; }
+  confirmAction("批量删除用户", "确认删除 <b>" + valid.length + "</b> 个用户？", async () => {
+    try {
+      const r = await api("POST", "/api/batch/users/delete", { uids });
+      renderBatchResult(r.results);
+    } catch (e) { toast(e.message, "error"); }
+  });
 });
 function renderBatchResult(results) {
   const ok = results.filter(r => r.ok).length;
@@ -714,13 +801,17 @@ function renderBatchResult(results) {
 }
 
 // ---------- 挂载 ----------
+let MOUNTS = [];
 async function loadAutomount() {
   try {
     const data = await api("GET", "/api/automount");
+    MOUNTS = data.items;
     $("mountCount").textContent = "共 " + data.total + " 条";
     $("mountTbody").innerHTML = data.items.map(m =>
       '<tr><td class="mono">' + esc(m.cn) + '</td><td class="mono">' + esc(m.nisMapEntry) + '</td>' +
-      '<td style="text-align:right"><button class="btn btn-sm btn-icon" title="删除" onclick="deleteMount(\'' + esc(m.cn) + '\')">🗑</button></td></tr>'
+      '<td style="text-align:right;white-space:nowrap">' +
+        '<button class="btn btn-sm btn-icon" title="编辑" onclick="editMount(\'' + esc(m.cn) + '\')">✎</button> ' +
+        '<button class="btn btn-sm btn-icon" title="删除" onclick="deleteMount(\'' + esc(m.cn) + '\')">🗑</button></td></tr>'
     ).join("");
     $("mountEmpty").style.display = data.items.length ? "none" : "block";
   } catch (e) { toast(e.message, "error"); }
@@ -744,20 +835,49 @@ window.submitAddMount = async function() {
     toast("挂载条目已添加", "success"); closeModal(); loadAutomount();
   } catch (e) { toast(e.message, "error"); }
 };
-window.deleteMount = async function(path) {
-  if (!confirm("确认删除挂载条目 " + path + "？")) return;
+window.editMount = function(path) {
+  const m = MOUNTS.find(x => x.cn === path);
+  if (!m) return;
+  let opts = "vers=3,rw", target = "";
+  if (m.nisMapEntry) {
+    const parts = m.nisMapEntry.replace(/^-fstype=nfs,/, "").split(/\s+/);
+    opts = parts[0] || "vers=3,rw";
+    target = parts.slice(1).join(" ");
+  }
+  openModal("编辑挂载: " + path, `
+    <div class="form-grid">
+      <div class="field full"><label>NFS 目标 *</label><input id="m_target" value="${esc(target)}"></div>
+      <div class="field full"><label>挂载选项</label><input id="m_opts" value="${esc(opts)}"></div>
+    </div>`,
+    '<button class="btn btn-primary" onclick="submitEditMount(\'' + esc(path) + '\')">保存</button>' +
+    '<button class="btn" onclick="closeModal()">取消</button>');
+};
+window.submitEditMount = async function(path) {
   try {
-    await api("POST", "/api/automount/delete", { mount_path: path });
-    toast("已删除", "success"); loadAutomount();
+    await api("POST", "/api/automount/update", {
+      mount_path: path, target: $("m_target").value.trim(),
+      opts: $("m_opts").value.trim() || "vers=3,rw",
+    });
+    toast("已保存", "success"); closeModal(); loadAutomount();
   } catch (e) { toast(e.message, "error"); }
+};
+window.deleteMount = function(path) {
+  confirmAction("删除挂载条目", "确认删除挂载条目 <b>" + esc(path) + "</b>？", async () => {
+    try {
+      await api("POST", "/api/automount/delete", { mount_path: path });
+      toast("已删除", "success"); loadAutomount();
+    } catch (e) { toast(e.message, "error"); }
+  });
 };
 
 // ---------- Sudo ----------
+let SUDO_RULES = [];
 async function loadSudo() {
   try {
     const data = await api("GET", "/api/sudo");
+    SUDO_RULES = data.items;
     $("sudoCount").textContent = "共 " + data.total + " 条";
-    $("sudoTbody").innerHTML = data.items.map(s => {
+    $("sudoTbody").innerHTML = data.items.map((s, i) => {
       const opts = (s.sudoOption || []).join(", ");
       return '<tr>' +
         '<td class="mono"><a href="#" onclick="showSudoRule(\'' + esc(s.cn) + '\');return false;">' + esc(s.cn) + '</a></td>' +
@@ -765,7 +885,11 @@ async function loadSudo() {
         '<td class="mono">' + esc((s.sudoHost || []).join(", ")) + '</td>' +
         '<td class="mono">' + esc((s.sudoCommand || []).join(", ")) + '</td>' +
         '<td class="mono">' + esc(opts) + '</td>' +
-        '<td style="text-align:right"><button class="btn btn-sm btn-icon" title="删除" onclick="deleteSudoRule(\'' + esc(s.cn) + '\')">🗑</button></td></tr>';
+        '<td style="text-align:right;white-space:nowrap">' +
+          '<button class="btn btn-sm btn-icon" title="上移" onclick="moveSudo(\'' + esc(s.cn) + '\',\'up\')" ' + (i === 0 ? 'disabled' : '') + '>↑</button> ' +
+          '<button class="btn btn-sm btn-icon" title="下移" onclick="moveSudo(\'' + esc(s.cn) + '\',\'down\')" ' + (i === data.items.length - 1 ? 'disabled' : '') + '>↓</button> ' +
+          '<button class="btn btn-sm btn-icon" title="编辑" onclick="editSudoRule(\'' + esc(s.cn) + '\')">✎</button> ' +
+          '<button class="btn btn-sm btn-icon" title="删除" onclick="deleteSudoRule(\'' + esc(s.cn) + '\')">🗑</button></td></tr>';
     }).join("");
     $("sudoEmpty").style.display = data.items.length ? "none" : "block";
   } catch (e) { toast(e.message, "error"); }
@@ -813,12 +937,47 @@ window.submitAddSudo = async function() {
     toast("sudo 规则已添加", "success"); closeModal(); loadSudo();
   } catch (e) { toast(e.message, "error"); }
 };
-window.deleteSudoRule = async function(name) {
-  if (!confirm("确认删除 sudo 规则 " + name + "？")) return;
+window.editSudoRule = function(name) {
+  const s = SUDO_RULES.find(x => x.cn === name);
+  if (!s) return;
+  openModal("编辑 Sudo 规则: " + s.cn, `
+    <div class="form-grid">
+      <div class="field"><label>排序 (sudoOrder)</label><input id="s_order" type="number" value="${esc(s.sudoOrder || '')}" placeholder="数字越小越优先"></div>
+      <div class="field"><label>描述</label><input id="s_desc" value="${esc(s.description || '')}"></div>
+      <div class="field full"><label>用户 (sudoUser) *，逗号分隔，组用 %组名</label><input id="s_user" value="${esc((s.sudoUser||[]).join(', '))}"></div>
+      <div class="field full"><label>主机 (sudoHost)，逗号分隔</label><input id="s_host" value="${esc((s.sudoHost||[]).join(', '))}"></div>
+      <div class="field full"><label>命令 (sudoCommand)，逗号分隔</label><input id="s_cmd" value="${esc((s.sudoCommand||[]).join(', '))}"></div>
+      <div class="field full"><label>选项 (sudoOption)，逗号分隔</label><input id="s_opt" value="${esc((s.sudoOption||[]).join(', '))}"></div>
+      <div class="field full"><label>RunAs 用户，逗号分隔</label><input id="s_runas" value="${esc((s.sudoRunAsUser||[]).join(', '))}"></div>
+    </div>`,
+    '<button class="btn btn-primary" onclick="submitEditSudo(\'' + esc(s.cn) + '\')">保存</button>' +
+    '<button class="btn" onclick="closeModal()">取消</button>');
+};
+window.submitEditSudo = async function(name) {
   try {
-    await api("DELETE", "/api/sudo/" + encodeURIComponent(name));
-    toast("已删除", "success"); loadSudo();
+    await api("POST", "/api/sudo/update", {
+      name: name, sudoOrder: $("s_order").value.trim(),
+      sudoUser: $("s_user").value.trim(), sudoHost: $("s_host").value.trim(),
+      sudoCommand: $("s_cmd").value.trim(), sudoOption: $("s_opt").value.trim(),
+      sudoRunAsUser: $("s_runas").value.trim(),
+      description: $("s_desc").value.trim(),
+    });
+    toast("已保存", "success"); closeModal(); loadSudo();
   } catch (e) { toast(e.message, "error"); }
+};
+window.moveSudo = async function(name, direction) {
+  try {
+    await api("POST", "/api/sudo/move", { name, direction });
+    loadSudo();
+  } catch (e) { toast(e.message, "error"); }
+};
+window.deleteSudoRule = function(name) {
+  confirmAction("删除 sudo 规则", "确认删除 sudo 规则 <b>" + esc(name) + "</b>？", async () => {
+    try {
+      await api("DELETE", "/api/sudo/" + encodeURIComponent(name));
+      toast("已删除", "success"); loadSudo();
+    } catch (e) { toast(e.message, "error"); }
+  });
 };
 
 // ---------- 启动 ----------

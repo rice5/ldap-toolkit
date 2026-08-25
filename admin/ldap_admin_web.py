@@ -349,7 +349,11 @@ class LDAPClient(object):
         for op, attr, value in changes:
             lines.append("{}: {}".format(op, attr))
             if value is not None:
-                lines.append("{}: {}".format(attr, value))
+                if isinstance(value, (list, tuple)):
+                    for v in value:
+                        lines.append("{}: {}".format(attr, v))
+                else:
+                    lines.append("{}: {}".format(attr, value))
             lines.append("-")
         ldif = "\n".join(lines) + "\n"
         ldif_path = pw_path = None
@@ -873,6 +877,14 @@ class BusinessLogic(object):
         self.ldap.delete(dn)
         return True
 
+    def update_automount(self, mount_path, target, opts="vers=3,rw"):
+        dn = "cn={},{}".format(mount_path, self.cfg.ldap_automount_base)
+        if self.ldap.search_one(self.cfg.ldap_automount_base, "(cn={})".format(ldap_filter_escape(mount_path)), ["dn"]) is None:
+            raise LDAPError("挂载条目 '{}' 未找到".format(mount_path))
+        nis_map_entry = "-fstype=nfs,{} {}".format(opts, target)
+        self.ldap.modify(dn, [("replace", "nisMapEntry", nis_map_entry)])
+        return {"mount_path": mount_path, "nisMapEntry": nis_map_entry}
+
     # ---- sudo 策略 ----
     def list_sudo_rules(self):
         attrs = ["cn", "sudoUser", "sudoHost", "sudoCommand", "sudoOption",
@@ -880,7 +892,7 @@ class BusinessLogic(object):
         items = []
         for dn, a in self.ldap.search(self.cfg.ldap_sudo_base, "(objectClass=sudoRole)", attrs):
             items.append(self._sudo_to_dict(dn, a))
-        items.sort(key=lambda x: x["cn"])
+        items.sort(key=lambda x: (int(x["sudoOrder"]) if x["sudoOrder"] else 0, x["cn"]))
         return items
 
     def _sudo_to_dict(self, dn, a):
@@ -952,6 +964,68 @@ class BusinessLogic(object):
             raise LDAPError("sudo 规则 '{}' 未找到".format(name))
         self.ldap.delete("cn={},{}".format(name, self.cfg.ldap_sudo_base))
         return True
+
+    def update_sudo_rule(self, name, data):
+        existing = self.get_sudo_rule(name)
+        if not existing:
+            raise LDAPError("sudo 规则 '{}' 未找到".format(name))
+        dn = "cn={},{}".format(name, self.cfg.ldap_sudo_base)
+
+        def split_multi(s):
+            return [x.strip() for x in (s or "").split(",") if x.strip()]
+
+        sudo_user = split_multi(data.get("sudoUser"))
+        sudo_host = split_multi(data.get("sudoHost") or "ALL")
+        sudo_cmd = split_multi(data.get("sudoCommand") or "ALL")
+        if not sudo_user:
+            raise LDAPError("sudoUser 不能为空")
+        if not sudo_cmd:
+            raise LDAPError("sudoCommand 不能为空")
+
+        changes = [
+            ("replace", "sudoUser", sudo_user),
+            ("replace", "sudoHost", sudo_host),
+            ("replace", "sudoCommand", sudo_cmd),
+        ]
+        # 多值可选字段：非空 replace，空则（若原有值）delete
+        for attr, new_vals, old_vals in [
+            ("sudoOption", split_multi(data.get("sudoOption")), existing["sudoOption"]),
+            ("sudoRunAsUser", split_multi(data.get("sudoRunAsUser")), existing["sudoRunAsUser"]),
+            ("sudoRunAsGroup", split_multi(data.get("sudoRunAsGroup")), existing["sudoRunAsGroup"]),
+        ]:
+            if new_vals:
+                changes.append(("replace", attr, new_vals))
+            elif old_vals:
+                changes.append(("delete", attr, None))
+        # 单值可选字段
+        for attr, new_val, old_val in [
+            ("sudoOrder", (data.get("sudoOrder") or "").strip(), existing["sudoOrder"]),
+            ("description", (data.get("description") or "").strip(), existing["description"]),
+        ]:
+            if new_val:
+                changes.append(("replace", attr, new_val))
+            elif old_val:
+                changes.append(("delete", attr, None))
+        self.ldap.modify(dn, changes)
+        return {"name": name}
+
+    def move_sudo_rule(self, name, direction):
+        """上移/下移 sudo 规则：交换位置后按新顺序重排 sudoOrder 为 0,1,2,..."""
+        rules = self.list_sudo_rules()  # 已按 sudoOrder 排序
+        idx = next((i for i, r in enumerate(rules) if r["cn"] == name), None)
+        if idx is None:
+            raise LDAPError("sudo 规则 '{}' 未找到".format(name))
+        target = idx - 1 if direction == "up" else idx + 1
+        if target < 0 or target >= len(rules):
+            raise LDAPError("已在最{}".format("上" if direction == "up" else "下"))
+        rules[idx], rules[target] = rules[target], rules[idx]
+        for i, r in enumerate(rules):
+            self._set_sudo_order(r["cn"], i)
+        return True
+
+    def _set_sudo_order(self, name, order):
+        dn = "cn={},{}".format(name, self.cfg.ldap_sudo_base)
+        self.ldap.modify(dn, [("replace", "sudoOrder", str(order))])
 
 
 #===============================================================================
@@ -1090,8 +1164,14 @@ class AdminWebHandler(BaseHTTPRequestHandler):
                 return self._api_add_automount(body)
             if path == "/api/automount/delete":
                 return self._api_delete_automount(body)
+            if path == "/api/automount/update":
+                return self._api_update_automount(body)
             if path == "/api/sudo":
                 return self._api_create_sudo_rule(body)
+            if path == "/api/sudo/update":
+                return self._api_update_sudo_rule(body)
+            if path == "/api/sudo/move":
+                return self._api_move_sudo_rule(body)
             return self._send_json({"error": "未知接口"}, 404)
         except LDAPError as e:
             return self._send_json({"error": str(e)}, 400)
@@ -1278,6 +1358,20 @@ class AdminWebHandler(BaseHTTPRequestHandler):
 
     def _api_delete_sudo_rule(self, name):
         self.logic.delete_sudo_rule(name)
+        return self._send_json({"ok": True})
+
+    def _api_update_automount(self, body):
+        r = self.logic.update_automount(body.get("mount_path", ""),
+                                        body.get("target", ""),
+                                        body.get("opts", "vers=3,rw"))
+        return self._send_json({"ok": True, **r})
+
+    def _api_update_sudo_rule(self, body):
+        r = self.logic.update_sudo_rule(body.get("name", ""), body)
+        return self._send_json({"ok": True, **r})
+
+    def _api_move_sudo_rule(self, body):
+        self.logic.move_sudo_rule(body.get("name", ""), body.get("direction", ""))
         return self._send_json({"ok": True})
 
     def log_message(self, fmt, *args):
