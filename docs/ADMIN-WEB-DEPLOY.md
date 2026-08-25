@@ -39,7 +39,7 @@ scp -r admin/web root@<server>:/opt/ldap-admin-web/
 
 ```bash
 cat > /opt/ldap-admin-web/ldap_admin_web.env << 'EOF'
-WEB_LISTEN=127.0.0.1
+WEB_LISTEN=0.0.0.0
 WEB_PORT=8080
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=<强密码>
@@ -151,6 +151,19 @@ ldap01 若需本机 httpd 反代（httpd24 已装，非 nginx），用 mod_proxy
     ProxyPassReverse / http://127.0.0.1:8080/
 </VirtualHost>
 ```
+
+### 4.5 防火墙（必做：限制 8080 仅反代节点可访问）
+
+服务监听 `0.0.0.0:8080` 后，8080 暴露在所有网卡，必须用防火墙限制来源——
+只放行反代节点（yum01），拒绝其他一切直连。管理站点持有 LDAP Manager 写权限，务必收紧。
+
+```bash
+# CentOS 7 firewalld：仅允许 yum01（如 192.0.2.15）访问 8080
+firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.0.2.15" port protocol="tcp" port="8080" accept'
+firewall-cmd --reload
+```
+
+> 若反代节点多（如 ldap02 也部署了本服务并被反代），把每个来源 IP 各加一条 rich rule。
 
 ### 5. 验证
 
