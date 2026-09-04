@@ -82,6 +82,7 @@
         name:
           - sssd
           - sssd-ldap
+          - sssd-tools
           - oddjob-mkhomedir
           - authselect
           - libsss_sudo

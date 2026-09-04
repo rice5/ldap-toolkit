@@ -174,12 +174,15 @@ def notify_alert(items, dry_run=False):
         
     full_msg = "\n".join(msg_lines)
     
-    # 经由 hermes alert 发送
+    # 经由 hermes alert 发送 (统一使用 Agent 间协同交互协议)
     hermes_bin = "/home/root1/.hermes/hermes-agent/venv/bin/hermes"
     alert_cmd = [
-        hermes_bin, "-p", "alert", "send",
-        "--to", "wecom:wrVvP8DgAA8wDhVhi4ZJ4qNBv3miUGbA",
-        full_msg
+        hermes_bin, "-p", "alert", "chat",
+        "--in", "/home/root1",
+        "-c", "Bot Chat",
+        "--create-if-missing",
+        "-Q", "-q",
+        f"Message from 🤖 operator (@operator): 请将以下离职账号进程清理报告统一推送给管理员：\n\n{full_msg}"
     ]
     subprocess.run(alert_cmd, capture_output=True, text=True)
 
