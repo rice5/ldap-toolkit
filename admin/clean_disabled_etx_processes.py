@@ -12,6 +12,7 @@ ETX 离职/禁用员工残留进程精准扫描与双阶段清理脚本
 
 import os
 import sys
+import re
 import json
 import argparse
 import subprocess
@@ -126,20 +127,37 @@ def run_cleanup(uids, dry_run=False):
     proc = subprocess.run(ansible_cmd, shell=True, capture_output=True, text=True)
     
     items = []
-    in_json = False
-    for line in proc.stdout.splitlines():
-        line_clean = line.replace('\r', '').strip()
-        if "CLEANUP_JSON_START" in line_clean:
-            in_json = True
+    
+    # 针对 Ansible JSON 输出块进行精准解析 (主机名 | CHANGED => { ... })
+    blocks = re.split(r'\n(?=[a-zA-Z0-9_-]+\s*\|\s*(?:CHANGED|SUCCESS)\s*=>\s*\{)', proc.stdout)
+    for block in blocks:
+        m_host = re.match(r'([a-zA-Z0-9_-]+)\s*\|\s*(?:CHANGED|SUCCESS)\s*=>\s*(\{.*)', block, re.DOTALL)
+        if not m_host:
             continue
-        if "CLEANUP_JSON_END" in line_clean:
+        host = m_host.group(1)
+        json_payload = m_host.group(2)
+        try:
+            data = json.loads(json_payload)
+            stdout = data.get("stdout", "")
             in_json = False
-            continue
-        if in_json and line_clean.startswith("{") and line_clean.endswith("}"):
-            try:
-                items.append(json.loads(line_clean))
-            except Exception:
-                pass
+            for line in stdout.splitlines():
+                line_clean = line.strip()
+                if "CLEANUP_JSON_START" in line_clean:
+                    in_json = True
+                    continue
+                if "CLEANUP_JSON_END" in line_clean:
+                    in_json = False
+                    continue
+                if in_json and line_clean.startswith("{") and line_clean.endswith("}"):
+                    try:
+                        item = json.loads(line_clean)
+                        item["host"] = host
+                        items.append(item)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+            
     return items
 
 def notify_alert(items, dry_run=False):
@@ -180,7 +198,6 @@ def notify_alert(items, dry_run=False):
         hermes_bin, "-p", "alert", "chat",
         "--in", "/home/root1",
         "-c", "Bot Chat",
-        "--create-if-missing",
         "-Q", "-q",
         f"Message from 🤖 operator (@operator): 请将以下离职账号进程清理报告统一推送给管理员：\n\n{full_msg}"
     ]
